@@ -1,0 +1,143 @@
+name: build
+
+on:
+  workflow_call: {}
+
+env:
+  LLVM_VERSION: "22"
+  LLVM_RELEASE: "22.1.8"
+
+jobs:
+  framework:
+    name: Framework
+    runs-on: ubuntu-latest
+    env:
+      # QQNT SDK / libc++ / CloverLoader-Release are public GitHub releases.
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: lukka/get-cmake@latest
+      - name: Install LLVM + Ninja
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh ${{ env.LLVM_VERSION }}
+          sudo apt-get install -y ninja-build binutils
+      # CloverDtsGen (Alka bindings -> framework/src/clovernt.gen.d.ts) must run
+      # before tsup, so framework types stay in sync with the C++ bindings.
+      - name: Generate type definitions
+        run: >-
+          cmake -S . -B build -G Ninja
+          -D CMAKE_BUILD_TYPE=Release
+          -D CMAKE_C_COMPILER=clang-${{ env.LLVM_VERSION }} -D CMAKE_CXX_COMPILER=clang++-${{ env.LLVM_VERSION }}
+          &&
+          cmake --build build --target CloverDts
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Build framework
+        working-directory: framework
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+      - name: Upload framework
+        uses: actions/upload-artifact@v7
+        with:
+          name: CloverCore-Framework
+          path: framework/dist/
+          if-no-files-found: error
+
+  build:
+    name: Build (${{ matrix.target.label }})
+    needs: framework
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: windows, arch: x64,   runner: windows-latest,    label: "Windows x64",   slot: "windows-x64" }
+          - { os: windows, arch: arm64, runner: windows-11-arm,     label: "Windows ARM64", slot: "windows-arm64" }
+          - { os: linux,   arch: x64,   runner: ubuntu-latest,      label: "Linux x64",     slot: "linux-x64" }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm,   label: "Linux ARM64",   slot: "linux-arm64" }
+    runs-on: ${{ matrix.target.runner }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: lukka/get-cmake@latest
+
+      - name: Set up MSVC (Windows)
+        if: matrix.target.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.target.arch == 'arm64' && 'arm64' || 'x64' }}
+
+      - name: Install LLVM (Windows)
+        if: matrix.target.os == 'windows'
+        shell: pwsh
+        run: |
+          $arch = if ('${{ matrix.target.arch }}' -eq 'arm64') { 'woa64' } else { 'win64' }
+          $url  = "https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_RELEASE }}/LLVM-${{ env.LLVM_RELEASE }}-${arch}.exe"
+          Write-Host "Downloading LLVM from $url"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\llvm-installer.exe"
+          Start-Process -Wait "$env:TEMP\llvm-installer.exe" -ArgumentList '/S'
+          'C:\Program Files\LLVM\bin' | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install LLVM + Ninja (Linux)
+        if: matrix.target.os == 'linux'
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh ${{ env.LLVM_VERSION }}
+          sudo apt-get install -y ninja-build binutils
+
+      - name: Configure (Windows)
+        if: matrix.target.os == 'windows'
+        run: >-
+          cmake -S . -B build -G Ninja
+          -D CMAKE_BUILD_TYPE=Release
+          -D CMAKE_C_COMPILER=clang-cl -D CMAKE_CXX_COMPILER=clang-cl
+
+      - name: Configure (Linux)
+        if: matrix.target.os == 'linux'
+        run: >-
+          cmake -S . -B build -G Ninja
+          -D CMAKE_BUILD_TYPE=Release
+          -D CMAKE_C_COMPILER=clang-${{ env.LLVM_VERSION }} -D CMAKE_CXX_COMPILER=clang++-${{ env.LLVM_VERSION }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Download framework
+        uses: actions/download-artifact@v7
+        with:
+          name: CloverCore-Framework
+          path: framework-dist
+
+      - name: Stage (Windows)
+        if: matrix.target.os == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item build/CloverCore.dll out/
+          Copy-Item -Recurse framework-dist out/framework
+
+      - name: Stage (Linux)
+        if: matrix.target.os == 'linux'
+        run: |
+          mkdir -p out
+          cp build/libCloverCore.so out/
+          strip --strip-unneeded out/libCloverCore.so || true
+          cp -r framework-dist out/framework
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: CloverCore-${{ matrix.target.slot }}
+          path: out/
+          if-no-files-found: error
