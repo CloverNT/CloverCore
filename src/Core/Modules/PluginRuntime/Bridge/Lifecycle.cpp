@@ -2,12 +2,14 @@
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/AlkaBindings.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Binding.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Lifecycle.hpp>
+#include <CloverNT/Runtime/Kernel.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <ranges>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -186,7 +188,8 @@ auto CloverContext::create(JsRuntime::State& state, const v8::Local<v8::Context>
     const auto   ctxObj  = v8::Object::New(isolate);
 
     setProp(context, ctxObj, "name", v8Str(isolate, record.name));
-    setProp(context, ctxObj, "version", v8Str(isolate, "0.0.1"));
+    setProp(context, ctxObj, "version", v8Str(isolate, CLOVERNT_VERSION_FULL));
+    setProp(context, ctxObj, "loaderVersion", v8Str(isolate, std::string{CloverNT::Runtime::Kernel::selfVersion()}));
     setProp(context, ctxObj, "coreDir", v8Str(isolate, state.mCoreDir.string()));
     (void) ctxObj->SetNativeDataProperty(
             context, v8Str(isolate, "plugins"), &pluginsGetter, nullptr, v8::External::New(isolate, &state));

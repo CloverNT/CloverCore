@@ -71,6 +71,8 @@ export interface CloverEvents {
 export interface CloverApi {
     readonly version: string;
 
+    readonly loaderVersion?: string;
+
     readonly coreDir?: string;
 
     readonly plugins?: PluginInfo[];
@@ -105,6 +107,7 @@ export interface CloverApi {
 export interface CloverContext {
     readonly name: string;
     readonly version: string;
+    readonly loaderVersion: string;
     readonly coreDir: string;
     readonly plugins: PluginInfo[];
     readonly logger: CloverLogger;

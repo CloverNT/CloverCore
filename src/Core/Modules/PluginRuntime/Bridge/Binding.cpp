@@ -2,15 +2,29 @@
 #include <CloverNT/API/Plugin/PluginManager.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/AlkaBindings.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Binding.hpp>
+#include <CloverNT/Runtime/Kernel.hpp>
 
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#ifndef CLOVERNT_VERSION_FULL
+    #define CLOVERNT_VERSION_FULL "0.0.0-unknown"
+#endif
+
 namespace CloverNT::Core::Modules::bridge {
+
+namespace {
+    constexpr std::string_view kCoreVersion{CLOVERNT_VERSION_FULL};
+    std::string loaderVersionString() {
+        return std::string{CloverNT::Runtime::Kernel::selfVersion()};
+    }
+} // namespace
 
 void Logger::factory(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
@@ -65,7 +79,8 @@ void LinkedBinding::registerBinding(const v8::Local<v8::Object>  exports,
         v8::Isolate*    isolate = v8::Isolate::GetCurrent();
         v8::HandleScope scope(isolate);
 
-        setProp(context, exports, "version", v8::String::NewFromUtf8Literal(isolate, "0.0.1"));
+        setProp(context, exports, "version", v8Str(isolate, kCoreVersion));
+        setProp(context, exports, "loaderVersion", v8Str(isolate, loaderVersionString()));
         if (state == nullptr) {
             return;
         }
@@ -222,7 +237,8 @@ auto Clovernt::create(JsRuntime::State& state, const v8::Local<v8::Context> cont
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
     const auto   ext     = v8::External::New(isolate, &state);
     const auto   clover  = v8::Object::New(isolate);
-    setProp(context, clover, "version", v8Str(isolate, "0.0.1"));
+    setProp(context, clover, "version", v8Str(isolate, kCoreVersion));
+    setProp(context, clover, "loaderVersion", v8Str(isolate, loaderVersionString()));
     setProp(context, clover, "coreDir", v8Str(isolate, state.mCoreDir.string()));
     setProp(context, clover, "log", makeFn(context, &Logger::factory, ext));
     (void) clover->SetNativeDataProperty(context, v8Str(isolate, "plugins"), &pluginsGetter, nullptr, ext);

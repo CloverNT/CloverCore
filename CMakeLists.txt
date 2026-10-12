@@ -16,6 +16,7 @@ if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
 endif ()
 
 add_compile_definitions(CLOVERNT_VERSION_STRING="${CLOVERNT_VERSION_STRING}")
+add_compile_definitions(CLOVERNT_VERSION_FULL="${CLOVERNT_VERSION_FULL}")
 
 ## Platform / arch macros
 if (WIN32)
