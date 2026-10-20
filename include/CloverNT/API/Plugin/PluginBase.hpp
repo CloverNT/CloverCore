@@ -40,9 +40,9 @@ namespace Plugin {
         void bindSelf(NativePlugin& plugin) noexcept;
         void clearSelf() noexcept;
 
-    protected:
-        ~PluginBase() = default; // not meant to be deleted through a PluginBase pointer
+        ~PluginBase() = default;
 
+    protected:
         [[nodiscard]] auto self() const -> NativePlugin&; // throws if used before bindSelf
 
         [[nodiscard]] auto logger() const -> Logger&;

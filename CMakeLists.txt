@@ -98,7 +98,7 @@ endif ()
 
 include_directories(include)
 
-add_library(CloverAPI STATIC
+set(CLOVER_API_SOURCES
         src/API/Exception.cpp
         src/API/Logger.cpp
         src/API/Utils/DynamicLibrary.cpp
@@ -110,27 +110,6 @@ add_library(CloverAPI STATIC
         $<$<PLATFORM_ID:Windows>:src/API/Utils/System.Windows.cpp>
         $<$<PLATFORM_ID:Linux>:src/API/Utils/System.Linux.cpp>
 )
-target_include_directories(CloverAPI PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(CloverAPI
-        PUBLIC
-        CloverNT_API_STATIC
-        $<$<CONFIG:Debug>:CloverNT_DEBUG>
-        ${CloverNT_SYSTEM_MACRO}
-        ${CloverNT_ARCH_MACRO}
-        PRIVATE
-        $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN>
-        $<$<PLATFORM_ID:Windows>:NOMINMAX>
-)
-target_link_libraries(CloverAPI PUBLIC CloverNT::Runtime)
-if (WIN32)
-    target_link_libraries(CloverAPI PUBLIC dbghelp)
-else ()
-    target_link_libraries(CloverAPI PUBLIC dl)
-endif ()
-set_target_properties(CloverAPI PROPERTIES
-        C_VISIBILITY_PRESET hidden
-        CXX_VISIBILITY_PRESET hidden
-        VISIBILITY_INLINES_HIDDEN ON)
 
 set(CLOVER_CORE_SOURCES
         src/Core/Event/Cancellable.cpp
@@ -164,6 +143,7 @@ set(CLOVER_CORE_SOURCES
 add_library(CloverCore SHARED
         src/Core/Library.cpp
         ${CLOVER_CORE_SOURCES}
+        ${CLOVER_API_SOURCES}
 )
 target_compile_definitions(CloverCore PRIVATE
         CloverNT_EXPORTS
@@ -173,9 +153,9 @@ target_compile_definitions(CloverCore PRIVATE
         ${CloverNT_ARCH_MACRO}
 )
 target_link_libraries(CloverCore PRIVATE
-        CloverAPI libhat Mortis nlohmann_json::nlohmann_json QQNT::QQNT Alka::Alka CloverNT::Runtime)
+        libhat Mortis nlohmann_json::nlohmann_json QQNT::QQNT Alka::Alka CloverNT::Runtime)
 if (WIN32)
-    target_link_libraries(CloverCore PRIVATE delayimp)
+    target_link_libraries(CloverCore PRIVATE delayimp dbghelp)
     target_link_options(CloverCore PRIVATE /DELAYLOAD:QQNT.dll)
 else ()
     target_link_libraries(CloverCore PRIVATE dl)
