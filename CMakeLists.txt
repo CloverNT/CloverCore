@@ -145,6 +145,9 @@ add_library(CloverCore SHARED
         ${CLOVER_CORE_SOURCES}
         ${CLOVER_API_SOURCES}
 )
+target_include_directories(CloverCore PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
 target_compile_definitions(CloverCore PRIVATE
         CloverNT_EXPORTS
         CloverNT_CORE_BUILD
