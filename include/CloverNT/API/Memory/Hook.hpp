@@ -380,7 +380,8 @@ namespace Detail {
             if (index < 0 || index >= MaxSlots) {
                 return;
             }
-            while (mInFlight[index].load(std::memory_order_acquire) != 0) {
+            const int ownDepth = tlsDepth()[index];
+            while (mInFlight[index].load(std::memory_order_acquire) > ownDepth) {
                 std::this_thread::yield();
             }
         }
@@ -393,16 +394,24 @@ namespace Detail {
             return mStates[index].lock();
         }
 
+        [[nodiscard]] static auto tlsDepth() noexcept -> std::array<int, MaxSlots>& {
+            thread_local std::array<int, MaxSlots> depth{};
+            return depth;
+        }
+
         template <int I>
         static auto trampoline(Args... args) -> R {
             auto& pool = instance();
             pool.mInFlight[I].fetch_add(1, std::memory_order_acq_rel);
+            ++tlsDepth()[I];
             struct InFlightGuard {
                 std::atomic<int>* counter;
+                int*              localDepth;
                 ~InFlightGuard() {
+                    --(*localDepth);
                     counter->fetch_sub(1, std::memory_order_release);
                 }
-            } inFlightGuard{&pool.mInFlight[I]};
+            } inFlightGuard{&pool.mInFlight[I], &tlsDepth()[I]};
 
             auto state = pool.state(I);
             if (!state) {

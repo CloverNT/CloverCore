@@ -148,9 +148,11 @@ add_library(CloverCore SHARED
 target_include_directories(CloverCore PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
-target_compile_definitions(CloverCore PRIVATE
+target_compile_definitions(CloverCore
+    PRIVATE
         CloverNT_EXPORTS
         CloverNT_CORE_BUILD
+    PUBLIC
         $<$<CONFIG:Debug>:CloverNT_DEBUG>
         ${CloverNT_SYSTEM_MACRO}
         ${CloverNT_ARCH_MACRO}
