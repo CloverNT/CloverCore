@@ -12,7 +12,6 @@ jobs:
     name: Framework
     runs-on: ubuntu-latest
     env:
-      # QQNT SDK / libc++ / CloverLoader-Release are public GitHub releases.
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
@@ -26,8 +25,6 @@ jobs:
           chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh ${{ env.LLVM_VERSION }}
           sudo apt-get install -y ninja-build binutils
-      # CloverDtsGen (Alka bindings -> framework/src/clovernt.gen.d.ts) must run
-      # before tsup, so framework types stay in sync with the C++ bindings.
       - name: Generate type definitions
         run: >-
           cmake -S . -B build -G Ninja
@@ -124,16 +121,16 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
-          Copy-Item build/CloverCore.dll out/
-          Copy-Item -Recurse framework-dist out/framework
+          Copy-Item -Recurse build/dist/CloverCore out/CloverCore
+          Copy-Item -Recurse framework-dist out/CloverCore/framework
 
       - name: Stage (Linux)
         if: matrix.target.os == 'linux'
         run: |
           mkdir -p out
-          cp build/libCloverCore.so out/
-          strip --strip-unneeded out/libCloverCore.so || true
-          cp -r framework-dist out/framework
+          cp -r build/dist/CloverCore out/CloverCore
+          strip --strip-unneeded out/CloverCore/CloverCore.so || true
+          cp -r framework-dist out/CloverCore/framework
 
       - name: Upload
         uses: actions/upload-artifact@v7

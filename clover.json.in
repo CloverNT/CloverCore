@@ -1,0 +1,8 @@
+{
+  "name": "CloverCore",
+  "type": "raw",
+  "version": "@CLOVERNT_VERSION@",
+  "author": "CloverNT",
+  "description": "Modern platform and Javascript plugin loader for CloverNT.",
+  "main": "@CLOVERCORE_MAIN@"
+}

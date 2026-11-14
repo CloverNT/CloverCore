@@ -1,0 +1,80 @@
+name: publish-sdk
+on:
+  workflow_call:
+    secrets:
+      SDK_REPO_DEPLOY_KEY:
+        description: Private half of a deploy key (with write access) of the SDK repository.
+        required: true
+
+env:
+  SDK_REPO: CloverNT/clovernt-sdk
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish SDK
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-sdk-${{ github.ref_type == 'tag' && 'release' || 'dev' }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: lukka/get-cmake@latest
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Download framework
+        uses: actions/download-artifact@v7
+        with:
+          name: CloverCore-Framework
+          path: framework-dist
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --short HEAD)"
+          # Same string the runtime reports as ctx.version (see cmake/Version.cmake).
+          core_version="$(cmake -DFIELD=full -P cmake/Version.cmake 2>&1 | tail -n 1)"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+              version="${GITHUB_REF_NAME#v}"
+          else
+              version="0.0.0-dev.g${sha}"
+          fi
+          node framework/scripts/make-sdk-package.mjs \
+              --dist framework-dist --out sdk-package \
+              --version "$version" --core-version "$core_version" --commit "$GITHUB_SHA"
+          {
+              echo "SDK_VERSION=$version"
+              echo "CORE_SHA=$sha"
+          } >> "$GITHUB_ENV"
+
+      - name: Publish
+        env:
+          SDK_DEPLOY_KEY: ${{ secrets.SDK_REPO_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SDK_DEPLOY_KEY" ]; then
+              echo "::error::The SDK_REPO_DEPLOY_KEY secret is missing or empty"
+              exit 1
+          fi
+          key="$RUNNER_TEMP/sdk_deploy_key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$SDK_DEPLOY_KEY" > "$key")
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/sdk_known_hosts"
+
+          export SDK_REMOTE="git@github.com:${SDK_REPO}.git"
+          export SDK_PKG_DIR=sdk-package
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+              export SDK_BRANCH=main SDK_TAG="$GITHUB_REF_NAME"
+          else
+              export SDK_BRANCH=dev
+          fi
+          export SDK_COMMIT_MESSAGE="CloverCore $SDK_VERSION ($CORE_SHA)
+
+          Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
+          bash .github/scripts/publish-sdk.sh

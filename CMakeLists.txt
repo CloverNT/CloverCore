@@ -166,6 +166,7 @@ else ()
     target_link_libraries(CloverCore PRIVATE dl)
 endif ()
 set_target_properties(CloverCore PROPERTIES
+        PREFIX "" # libCloverCore.so -> CloverCore.so
         C_VISIBILITY_PRESET hidden
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON)
@@ -173,6 +174,14 @@ if (NOT WIN32)
     target_link_options(CloverCore PRIVATE
             "LINKER:--exclude-libs,libc++.a:libc++abi.a:libhat.a:libMortis.a")
 endif ()
+
+set(CLOVERCORE_MAIN "CloverCore${CMAKE_SHARED_LIBRARY_SUFFIX}")
+set(CLOVERCORE_DIST "${CMAKE_CURRENT_BINARY_DIR}/dist/CloverCore")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/clover.json.in" "${CLOVERCORE_DIST}/clover.json" @ONLY)
+add_custom_command(TARGET CloverCore POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CLOVERCORE_DIST}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:CloverCore>" "${CLOVERCORE_DIST}/"
+        VERBATIM)
 
 option(CLOVERNT_GENERATE_DTS "Generate framework/src/clovernt.gen.d.ts from the Alka bindings at build time" ON)
 if (CLOVERNT_GENERATE_DTS)

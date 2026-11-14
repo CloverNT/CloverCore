@@ -40,14 +40,14 @@ plugins/
 {
   "name": "CloverCore",
   "type": "raw", // 特殊的类型，以后会注明
-  "version": "1.0.0",
+  "version": "1.0.0", // 由构建自动填入
   "author": "CloverNT",
   "description": "Modern platform and Javascript plugin loader for CloverNT.",
-  "main": "CloverCore.dll" // 在Linux上会是libCloverCore.so
+  "main": "CloverCore.dll" // 在Linux上会是CloverCore.so
 }
 ```
 
-> 目前还没有做`clover.json`的自动生成，待插件模板完善后会提供此功能
+> `clover.json`由构建时根据 `clover.json.in` 自动生成（版本号取构建版本的数字部分，没有 tag 时是 `0.0.0`），和 CloverCore 动态库一起输出到 `build/dist/CloverCore/`，CI 产物同样是 `CloverCore/` 目录，直接放入 `plugins/` 即可
 
 在确保全部部署好后，启动 CloverLoader 即可。
 
