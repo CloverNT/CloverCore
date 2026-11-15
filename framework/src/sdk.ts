@@ -137,12 +137,26 @@ export interface CloverContext {
     onUnload(fn: () => void | Promise<void>): void;
 }
 
+export interface PluginHooks {
+    onLoad(ctx: CloverContext): void;
+
+    onUnload?(): void;
+}
+
+export type PluginSetup = (ctx: CloverContext) => void | (() => void);
+
+export type PluginDefinition = PluginHooks | PluginSetup;
+
 export type PluginEntry =
     | ((ctx: CloverContext) => void | (() => void) | Promise<void>)
     | {
     onLoad(ctx: CloverContext): void | Promise<void>;
     onUnload?(): void | Promise<void>;
 };
+
+export function definePlugin<T extends PluginDefinition>(plugin: T): T {
+    return plugin;
+}
 
 function runtime(): CloverApi {
     const api = (globalThis as { clovernt?: CloverApi }).clovernt;

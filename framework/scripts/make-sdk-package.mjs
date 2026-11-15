@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import {cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from "node:fs";
+import {cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync} from "node:fs";
 import {dirname, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {parseArgs} from "node:util";
@@ -24,31 +24,38 @@ if (!semver.test(args.version)) {
 
 const dist = resolve(args.dist);
 const out = resolve(args.out);
-const js = join(dist, "sdk", "index.js");
-const dts = join(dist, "sdk", "index.d.ts");
-for (const f of [js, dts, resolve(args.license)]) {
+const sdkDir = join(dist, "sdk");
+const js = join(sdkDir, "index.js");
+for (const f of [js, join(sdkDir, "index.d.ts"), resolve(args.license)]) {
     if (!existsSync(f)) {
         throw new Error(`missing ${f} (run \`npm run build\` first?)`);
     }
 }
-if (/\bfrom\s+['"]\.{1,2}\//.test(readFileSync(dts, "utf8"))) {
-    throw new Error(`${dts} still imports relative modules, it would be broken outside of the framework`);
+const declarations = readdirSync(sdkDir).filter((f) => f.endsWith(".d.ts"));
+for (const f of declarations) {
+    for (const [, specifier] of readFileSync(join(sdkDir, f), "utf8").matchAll(/\bfrom\s+["'](\.{1,2}\/[^"']+)["']/g)) {
+        if (!declarations.includes(`${join(specifier).replace(/^\.[\\/]/, "")}.d.ts`)) {
+            throw new Error(`${f} imports ${specifier}, which is not part of the package`);
+        }
+    }
 }
 
 rmSync(out, {recursive: true, force: true});
 mkdirSync(out, {recursive: true});
 cpSync(js, join(out, "index.js"));
-cpSync(dts, join(out, "index.d.ts"));
+for (const f of declarations) {
+    cpSync(join(sdkDir, f), join(out, f));
+}
 cpSync(resolve(args.license), join(out, "LICENSE"));
 
 const pkg = {
     name: "@clovernt/sdk",
     version: args.version,
     description: "Type definitions and runtime proxy for CloverNT JavaScript plugins (generated from CloverCore).",
-    license: "SEE IN LICENSE",
+    license: "SEE LICENSE IN LICENSE",
     main: "index.js",
     types: "index.d.ts",
-    files: ["index.js", "index.d.ts", "LICENSE"],
+    files: ["index.js", "*.d.ts", "LICENSE"],
     repository: {type: "git", url: "git+https://github.com/CloverNT/CloverCore.git", directory: "framework"},
     peerDependencies: {electron: "*", "@types/node": "*"},
     peerDependenciesMeta: {electron: {optional: true}, "@types/node": {optional: true}},

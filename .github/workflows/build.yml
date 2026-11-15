@@ -39,6 +39,7 @@ jobs:
         working-directory: framework
         run: |
           npm install --no-audit --no-fund
+          npm run typecheck
           npm run build
       - name: Upload framework
         uses: actions/upload-artifact@v7

@@ -6,14 +6,12 @@
   "description": "CloverNT JavaScript plugin framework + SDK (loaded by the native runtime).",
   "scripts": {
     "build": "tsup",
-    "typecheck": "tsc --noEmit",
-    "build:examples": "node scripts/build-examples.mjs",
-    "typecheck:examples": "node scripts/build-examples.mjs --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "electron": "^37.10.3",
-    "tsup": "^8.5.1",
-    "typescript": "^5.9.3"
+    "tsup": "^9.0.0",
+    "typescript": "^7.0.2"
   }
 }

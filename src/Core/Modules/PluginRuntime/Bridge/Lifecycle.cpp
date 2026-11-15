@@ -10,6 +10,7 @@
 #include <mutex>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -21,6 +22,46 @@ using PluginBinding  = JsRuntime::State::PluginBinding;
 
 namespace {
     bool gShuttingDown = false;
+
+    [[nodiscard]] auto functionProp(const v8::Local<v8::Context> context,
+                                    const v8::Local<v8::Object>  object,
+                                    const char*                  key) -> v8::Local<v8::Function> {
+        if (const auto value = getProp(context, object, key); !value.IsEmpty() && value->IsFunction()) {
+            return value.As<v8::Function>();
+        }
+        return {};
+    }
+
+    [[nodiscard]] auto resolvePluginExports(const v8::Local<v8::Context> context, const v8::Local<v8::Value> exports)
+            -> v8::Local<v8::Value> {
+        if (exports.IsEmpty() || exports->IsFunction() || !exports->IsObject()) {
+            return exports;
+        }
+        const auto object = exports.As<v8::Object>();
+        if (!functionProp(context, object, "onLoad").IsEmpty()) {
+            return exports;
+        }
+        const auto fallback = getProp(context, object, "default");
+        if (fallback.IsEmpty()) {
+            return exports;
+        }
+        if (fallback->IsFunction()) {
+            return fallback;
+        }
+        if (fallback->IsObject() && !functionProp(context, fallback.As<v8::Object>(), "onLoad").IsEmpty()) {
+            return fallback;
+        }
+        return exports;
+    }
+
+    void warnIfAsync(const std::string& name, const v8::Local<v8::Value> result, const std::string_view what) {
+        if (!result.IsEmpty() && result->IsPromise()) {
+            JsRuntime::State::logger().warn("'{}': {} returned a Promise. The JS plugin lifecycle is synchronous, "
+                                            "so the result is dropped and rejections are never reported.",
+                                            name,
+                                            what);
+        }
+    }
 } // namespace
 
 void CloverContext::setShuttingDown(const bool value) {
@@ -358,11 +399,11 @@ auto PluginLifecycle::load(JsRuntime::State& state, const Plugin::JsPlugin& plug
         }
 
         const auto ctxObj = CloverContext::create(state, context, *record);
-        if (exports->IsFunction()) {
+        if (const auto entry = resolvePluginExports(context, exports); entry->IsFunction()) {
             v8::Local<v8::Value> ctxArgs[] = {ctxObj};
             v8::Local<v8::Value> disposeVal;
             const bool           called =
-                    exports.As<v8::Function>()->Call(context, context->Global(), 1, ctxArgs).ToLocal(&disposeVal);
+                    entry.As<v8::Function>()->Call(context, context->Global(), 1, ctxArgs).ToLocal(&disposeVal);
             if (!called) {
                 const std::string err =
                         tryCatch.HasCaught() ? describeException(isolate, context, tryCatch) : "plugin entry threw";
@@ -377,26 +418,32 @@ auto PluginLifecycle::load(JsRuntime::State& state, const Plugin::JsPlugin& plug
                 disposer.kind = Disposer::Kind::CallFn;
                 disposer.fn.Reset(isolate, disposeVal.As<v8::Function>());
                 record->disposers.push_back(std::move(disposer));
+            } else {
+                warnIfAsync(name, disposeVal, "the plugin entry");
             }
-        } else if (exports->IsObject()) {
-            const auto object = exports.As<v8::Object>();
-            if (const auto onLoad = getProp(context, object, "onLoad"); !onLoad.IsEmpty() && onLoad->IsFunction()) {
-                v8::Local<v8::Value> ctxArgs[] = {ctxObj};
-                if (onLoad.As<v8::Function>()->Call(context, object, 1, ctxArgs).IsEmpty()) {
-                    const std::string        err = tryCatch.HasCaught() ? describeException(isolate, context, tryCatch)
-                                                                        : "plugin onLoad threw";
-                    std::vector<std::string> disposeErrors;
-                    CloverContext::runDisposers(context, *record, disposeErrors);
-                    CloverContext::invalidateBindings(state, record.get());
-                    rollback();
-                    return jsError("failed to load '" + name + "': " + err, CommonErrorCode::CallbackFailed);
-                }
-                if (const auto onUnload = getProp(context, object, "onUnload");
-                    !onUnload.IsEmpty() && onUnload->IsFunction()) {
-                    record->onUnload.Reset(isolate, onUnload.As<v8::Function>());
-                    record->onUnloadThis.Reset(isolate, object);
-                }
+        } else if (entry->IsObject() && !functionProp(context, entry.As<v8::Object>(), "onLoad").IsEmpty()) {
+            const auto           object    = entry.As<v8::Object>();
+            v8::Local<v8::Value> ctxArgs[] = {ctxObj};
+            v8::Local<v8::Value> loadResult;
+            if (!functionProp(context, object, "onLoad")->Call(context, object, 1, ctxArgs).ToLocal(&loadResult)) {
+                const std::string err =
+                        tryCatch.HasCaught() ? describeException(isolate, context, tryCatch) : "plugin onLoad threw";
+                std::vector<std::string> disposeErrors;
+                CloverContext::runDisposers(context, *record, disposeErrors);
+                CloverContext::invalidateBindings(state, record.get());
+                rollback();
+                return jsError("failed to load '" + name + "': " + err, CommonErrorCode::CallbackFailed);
             }
+            warnIfAsync(name, loadResult, "onLoad");
+            if (const auto onUnload = functionProp(context, object, "onUnload"); !onUnload.IsEmpty()) {
+                record->onUnload.Reset(isolate, onUnload);
+                record->onUnloadThis.Reset(isolate, object);
+            }
+        } else {
+            JsRuntime::State::logger().warn(
+                    "'{}': the main entry exports neither a function nor an object with onLoad, so nothing was "
+                    "called. Export the plugin as `export default` or `export function onLoad`.",
+                    name);
         }
     }
 

@@ -1,23 +1,22 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "module": "CommonJS",
-    "moduleResolution": "Node",
+    "target": "ES2024",
     "lib": [
-      "ES2022",
+      "ES2024",
       "DOM"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": [
+      "node"
     ],
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
     "skipLibCheck": true,
-    "types": [
-      "node"
-    ],
-    "outDir": "dist",
-    "declaration": false
+    "noEmit": true
   },
   "include": [
     "src"
