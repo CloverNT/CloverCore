@@ -49,8 +49,10 @@ namespace {
                 {"seq", packet.seq},
                 {"command", packet.command},
                 {"uin", packet.uin},
+                {"uid", packet.uid},
                 {"encryption", encName(packet.encryption)},
                 {"body", hexEncode(packet.body)},
+                {"injected", packet.injected},
         };
     }
 
@@ -88,9 +90,10 @@ namespace {
     }
 
     auto credentialToPayload(Event::Event& event) -> nlohmann::json {
-        const auto& [uin, a2, d2, d2Key] = dynamic_cast<Event::CredentialEvent&>(event).credential();
+        const auto& [uin, uid, a2, d2, d2Key] = dynamic_cast<Event::CredentialEvent&>(event).credential();
         return nlohmann::json{
                 {"uin", uin},
+                {"uid", uid},
                 {"a2", hexEncode(a2)},
                 {"d2", hexEncode(d2)},
                 {"d2Key", hexEncode(d2Key)},

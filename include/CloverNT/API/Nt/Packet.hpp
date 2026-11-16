@@ -31,9 +31,12 @@ enum class Encryption : std::uint8_t {
 struct Packet {
     std::uint32_t seq{};
     std::string   command;
-    std::string   uin;
+    std::string   uin; ///< e.g. "10001".
+    std::string   uid; ///< NT account id ("u_...").
     Encryption    encryption{Encryption::None};
     Bytes         body;
+
+    bool injected{false};
 };
 
 /// A plaintext o3 secure-channel packet.
@@ -44,7 +47,8 @@ struct O3Packet {
 
 /// The captured session credentials.
 struct Credential {
-    std::string                  uin;
+    std::string                  uin; ///< Numeric account, e.g. "10001".
+    std::string                  uid; ///< NT account id ("u_...").
     Bytes                        a2;
     Bytes                        d2;
     std::array<std::uint8_t, 16> d2Key{};
@@ -155,6 +159,8 @@ namespace Codec {
         Detail::putString(out, packet.command);
         Detail::putString(out, packet.uin);
         Detail::putBytes(out, packet.body);
+        out.push_back(packet.injected ? std::uint8_t{1} : std::uint8_t{0});
+        Detail::putString(out, packet.uid);
         return out;
     }
 
@@ -167,6 +173,11 @@ namespace Codec {
             return std::nullopt;
         }
         packet.encryption = static_cast<Encryption>(enc);
+
+        if (std::uint8_t flags = 0; reader.readU8(flags)) {
+            packet.injected = (flags & 1U) != 0;
+            (void) reader.readString(packet.uid);
+        }
         return packet;
     }
 
@@ -192,6 +203,7 @@ namespace Codec {
         Detail::putBytes(out, credential.a2);
         Detail::putBytes(out, credential.d2);
         out.insert(out.end(), credential.d2Key.begin(), credential.d2Key.end());
+        Detail::putString(out, credential.uid);
         return out;
     }
 
@@ -202,6 +214,7 @@ namespace Codec {
             !reader.readBytes(credential.d2) || !reader.readRaw(credential.d2Key.data(), credential.d2Key.size())) {
             return std::nullopt;
         }
+        (void) reader.readString(credential.uid);
         return credential;
     }
 

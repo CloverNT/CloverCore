@@ -241,7 +241,7 @@ struct Alka::Converter<std::array<std::uint8_t, 16>> {
         return Alka::Converter<std::span<const std::uint8_t>>::toJs(cx, std::span<const std::uint8_t>{value});
     }
     static auto fromJs(ConvertCtx& cx, v8::Local<v8::Value> value) -> Result<std::array<std::uint8_t, 16>> {
-        auto bytes = Alka::Converter<std::vector<std::uint8_t>>::fromJs(cx, value);
+        auto bytes = Converter<std::vector<std::uint8_t>>::fromJs(cx, value);
         if (!bytes) {
             return std::unexpected(std::move(bytes).error());
         }
@@ -257,8 +257,6 @@ struct Alka::TsTypeName<std::array<std::uint8_t, 16>> {
     }
 };
 
-// The public SSO value types, bound declaratively so JS gets named `Packet` /
-// `Credential` objects (byte fields as Uint8Array) with auto-generated .d.ts.
 template <>
 struct Alka::Bind<CloverNT::Nt::Packet> : Class<CloverNT::Nt::Packet, "Packet"> {
     using T                       = CloverNT::Nt::Packet;
@@ -266,6 +264,7 @@ struct Alka::Bind<CloverNT::Nt::Packet> : Class<CloverNT::Nt::Packet, "Packet"> 
     static constexpr auto members = Alka::members(Alka::prop<&T::seq>(readonly),
                                                   Alka::prop<&T::command>(readonly),
                                                   Alka::prop<&T::uin>(readonly),
+                                                  Alka::prop<&T::uid>(readonly),
                                                   Alka::prop<&T::encryption>(readonly),
                                                   Alka::prop<&T::body>(readonly));
 };
@@ -275,6 +274,7 @@ struct Alka::Bind<CloverNT::Nt::Credential> : Class<CloverNT::Nt::Credential, "C
     using T                       = CloverNT::Nt::Credential;
     static constexpr auto doc     = "Captured session credentials.";
     static constexpr auto members = Alka::members(Alka::prop<&T::uin>(readonly),
+                                                  Alka::prop<&T::uid>(readonly),
                                                   Alka::prop<&T::a2>(readonly),
                                                   Alka::prop<&T::d2>(readonly),
                                                   Alka::prop<&T::d2Key>(readonly));
