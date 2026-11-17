@@ -509,18 +509,19 @@ namespace Detail {
     }
 
     auto createImportHook(const std::string_view               moduleName,
-                                             const std::string_view               importModule,
-                                             const std::string_view               functionName,
-                                             const Address                        detour,
-                                             void**                               originalSlot,
-                                             const std::weak_ptr<Plugin::Plugin>& owner,
-                                             std::shared_ptr<ResourcePayload>     payload) -> Expected<ResourceId> {
+                          const std::string_view               importModule,
+                          const std::string_view               functionName,
+                          const Address                        detour,
+                          const int                            priority,
+                          void**                               originalSlot,
+                          const std::weak_ptr<Plugin::Plugin>& owner,
+                          std::shared_ptr<ResourcePayload>     payload) -> Expected<ResourceId> {
         auto runtime = hookRuntime();
         if (!runtime) {
             return unexpected(runtime.error());
         }
         return runtime->get().createImportHook(
-                moduleName, importModule, functionName, detour, originalSlot, owner, std::move(payload));
+                moduleName, importModule, functionName, detour, priority, originalSlot, owner, std::move(payload));
     }
 
     auto enableResource(const ResourceId id) -> Expected<void> {

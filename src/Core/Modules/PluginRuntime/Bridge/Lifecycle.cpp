@@ -231,7 +231,9 @@ auto CloverContext::create(JsRuntime::State& state, const v8::Local<v8::Context>
     setProp(context, ctxObj, "name", v8Str(isolate, record.name));
     setProp(context, ctxObj, "version", v8Str(isolate, CLOVERNT_VERSION_FULL));
     setProp(context, ctxObj, "loaderVersion", v8Str(isolate, std::string{CloverNT::Runtime::Kernel::selfVersion()}));
+    setProp(context, ctxObj, "qqVersion", v8Str(isolate, std::string{CloverNT::Runtime::Kernel::qqVersion()}));
     setProp(context, ctxObj, "coreDir", v8Str(isolate, state.mCoreDir.string()));
+    setProp(context, ctxObj, "pluginsDir", v8Str(isolate, std::string{CloverNT::Runtime::Kernel::pluginsDir()}));
     (void) ctxObj->SetNativeDataProperty(
             context, v8Str(isolate, "plugins"), &pluginsGetter, nullptr, v8::External::New(isolate, &state));
     setProp(context, ctxObj, "logger", Logger::create(state, context, record.name));

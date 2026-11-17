@@ -13,6 +13,10 @@
 #include <utility>
 #include <vector>
 
+namespace CloverNT::Plugin {
+class NativePlugin;
+}
+
 namespace CloverNT::Core::Modules {
 
 class JsRuntime;
@@ -54,6 +58,10 @@ private:
     [[nodiscard]] auto teardownPlugin(std::shared_ptr<Plugin::Plugin> const& plugin,
                                       bool                                   recoverable,
                                       bool                                   finalShutdown) -> Expected<void>;
+    [[nodiscard]] auto loadNativePlugin(Plugin::Manifest manifest, std::filesystem::path const& directory)
+            -> Expected<std::shared_ptr<Plugin::NativePlugin>>;
+    [[nodiscard]] auto reloadNativePlugin(std::shared_ptr<Plugin::NativePlugin> const& plugin) -> Expected<void>;
+    void               commitNativePlugin(std::shared_ptr<Plugin::NativePlugin> const& plugin);
     [[nodiscard]] auto initializeState() -> Expected<void>;
     [[nodiscard]] auto loadConfiguredPlugins() -> Expected<void>;
     [[nodiscard]] auto unloadLoadedPlugins() -> Expected<void>;

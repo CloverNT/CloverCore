@@ -21,4 +21,18 @@ namespace CloverNT::Core::Utils::System {
 #endif
 }
 
+[[nodiscard]] inline ModuleHandle GetModuleHandleOf(const void* address) noexcept {
+#ifdef CloverNT_SYSTEM_WINDOWS
+    HMODULE module = nullptr;
+    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              static_cast<LPCWSTR>(address),
+                              &module) != 0
+                   ? module
+                   : nullptr;
+#elif defined(CloverNT_SYSTEM_LINUX)
+    Dl_info info{};
+    return ::dladdr(address, &info) != 0 ? info.dli_fbase : nullptr;
+#endif
+}
+
 } // namespace CloverNT::Core::Utils::System

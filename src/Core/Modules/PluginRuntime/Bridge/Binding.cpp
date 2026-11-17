@@ -24,6 +24,12 @@ namespace {
     std::string loaderVersionString() {
         return std::string{CloverNT::Runtime::Kernel::selfVersion()};
     }
+    std::string qqVersionString() {
+        return std::string{CloverNT::Runtime::Kernel::qqVersion()};
+    }
+    std::string pluginsDirString() {
+        return std::string{CloverNT::Runtime::Kernel::pluginsDir()};
+    }
 } // namespace
 
 void Logger::factory(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -81,6 +87,8 @@ void LinkedBinding::registerBinding(const v8::Local<v8::Object>  exports,
 
         setProp(context, exports, "version", v8Str(isolate, kCoreVersion));
         setProp(context, exports, "loaderVersion", v8Str(isolate, loaderVersionString()));
+        setProp(context, exports, "qqVersion", v8Str(isolate, qqVersionString()));
+        setProp(context, exports, "pluginsDir", v8Str(isolate, pluginsDirString()));
         if (state == nullptr) {
             return;
         }
@@ -239,7 +247,9 @@ auto Clovernt::create(JsRuntime::State& state, const v8::Local<v8::Context> cont
     const auto   clover  = v8::Object::New(isolate);
     setProp(context, clover, "version", v8Str(isolate, kCoreVersion));
     setProp(context, clover, "loaderVersion", v8Str(isolate, loaderVersionString()));
+    setProp(context, clover, "qqVersion", v8Str(isolate, qqVersionString()));
     setProp(context, clover, "coreDir", v8Str(isolate, state.mCoreDir.string()));
+    setProp(context, clover, "pluginsDir", v8Str(isolate, pluginsDirString()));
     setProp(context, clover, "log", makeFn(context, &Logger::factory, ext));
     (void) clover->SetNativeDataProperty(context, v8Str(isolate, "plugins"), &pluginsGetter, nullptr, ext);
     setProp(context, clover, "deasync", Deasync::create(state, context));

@@ -23,7 +23,6 @@ namespace CloverNT::Memory::Hook {
 
 struct Options {
     std::weak_ptr<Plugin::Plugin> owner;
-    // Honored only by inline hooks; import hooks ignore it.
     int priority{};
 };
 
@@ -671,6 +670,7 @@ namespace Import {
                                                         importModule,
                                                         functionName,
                                                         reinterpret_cast<Address>(state.value()->rawFunction()),
+                                                        options.priority,
                                                         state.value()->originalSlot(),
                                                         options.owner,
                                                         std::move(payload));

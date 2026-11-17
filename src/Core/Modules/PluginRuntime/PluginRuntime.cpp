@@ -11,10 +11,12 @@
 #include <CloverNT/Core/Modules/PluginRuntime.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/JsRuntime.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/PluginResolver.hpp>
+#include <CloverNT/Core/Platform/NativeImage.hpp>
 #include <CloverNT/Core/Platform/NodeEnvironment.hpp>
 #include <CloverNT/Core/Utils/System.hpp>
 #include <CloverNT/Runtime/Kernel.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -106,6 +108,19 @@ namespace {
 
     std::string pluginLabel(std::string_view name, std::optional<Plugin::Version> const& version) {
         return version ? std::format("{} v{}", name, version->toString()) : std::string(name);
+    }
+
+    // Whether the calling thread is running code of the module containing `addressInModule`, in
+    // which case freeing that module would pull code out from under the caller.
+    bool runsInModuleOf(const void* addressInModule) {
+        const auto module = Core::Utils::System::GetModuleHandleOf(addressInModule);
+        if (module == nullptr) {
+            return false;
+        }
+        const auto trace = StackTrace::capture(0, 128);
+        return std::ranges::any_of(trace.addresses(), [&](const void* frame) {
+            return Core::Utils::System::GetModuleHandleOf(frame) == module;
+        });
     }
 
     auto makeJsPlugin(Plugin::Manifest manifest, std::filesystem::path const& pluginDirectory)
@@ -642,68 +657,14 @@ auto PluginRuntime::loadConfiguredPlugins() -> Expected<void> {
             continue;
         }
 
-        auto pluginEntry = (pluginDirectory / manifest.entry).lexically_normal();
-        if (std::filesystem::path(manifest.entry).is_absolute() ||
-            !CloverNT::Utils::System::IsPathInside(pluginEntry, pluginDirectory) ||
-            !std::filesystem::exists(pluginEntry, ec) || ec) {
-            failed.emplace(name);
-            mReporter.recordFailed(name, "invalid entry path: " + manifest.entry);
-            continue;
-        }
-
-        auto plugin = std::make_shared<Plugin::NativePlugin>(std::move(manifest), pluginDirectory, pluginEntry);
-        plugin->setState(Plugin::PluginState::Loading);
-
-        if (auto loadedLibrary = plugin->mLibrary.load(plugin->entryPath(), plugin->directory()); !loadedLibrary) {
-            plugin->setState(Plugin::PluginState::Failed);
-            failed.emplace(name);
-            mReporter.recordFailed(name, "failed to load library: " + loadedLibrary.error().message);
-            continue;
-        }
-
-        auto loadCallback = plugin->mLibrary.getSymbol<Plugin::NativePlugin::Callback>("clovernt_plugin_load");
-        if (!loadCallback) {
-            (void) plugin->mLibrary.close();
-            plugin->setState(Plugin::PluginState::Failed);
-            failed.emplace(name);
-            mReporter.recordFailed(name, "does not export clovernt_plugin_load: " + loadCallback.error().message);
-            continue;
-        }
-        plugin->mLoadCallback = loadCallback.value();
-
-        bool loaded = false;
-        try {
-            CurrentPluginScope currentPlugin(plugin);
-            loaded = guardVeh([&] { return plugin->mLoadCallback(*plugin); });
-        } catch (const std::exception& e) {
-            loaded = false;
-            mReporter.recordFailed(name, std::string("load callback threw: ") + e.what());
-        } catch (...) {
-            loaded = false;
-        }
-
+        auto loaded = loadNativePlugin(std::move(manifest), pluginDirectory);
         if (!loaded) {
-            if (auto runtime = hookRuntime()) {
-                (void) runtime->get().clearPluginResources(plugin->name());
-            }
-            (void) Event::EventBus::clearPlugin(plugin->name());
-            (void) plugin->mLibrary.close();
-            plugin->setState(Plugin::PluginState::Failed);
             failed.emplace(name);
-            mReporter.recordFailed(name, "load callback failed");
+            mReporter.recordFailed(name, loaded.error().message);
             continue;
         }
-
-        plugin->setUnloadable(plugin->hasUnloadHandler());
-
-        std::string loadedLabel = pluginLabel(plugin->name(), plugin->manifest().version);
-        {
-            std::lock_guard lock(mMutex);
-            plugin->setState(Plugin::PluginState::Loaded);
-            mLoadedPlugins.emplace(std::string(plugin->name()), plugin);
-            mLoadOrder.emplace_back(plugin->name());
-        }
-        mReporter.recordLoaded(loadedLabel);
+        commitNativePlugin(loaded.value());
+        mReporter.recordLoaded(pluginLabel(name, loaded.value()->manifest().version));
     }
 
     if (mJsPending == 0) {
@@ -717,6 +678,73 @@ auto PluginRuntime::loadConfiguredPlugins() -> Expected<void> {
         mHasFailedUnload         = false;
     }
     return {};
+}
+
+auto PluginRuntime::loadNativePlugin(Plugin::Manifest manifest, std::filesystem::path const& directory)
+        -> Expected<std::shared_ptr<Plugin::NativePlugin>> {
+    const auto entryPath = (directory / manifest.entry).lexically_normal();
+    if (std::error_code ec; std::filesystem::path(manifest.entry).is_absolute() ||
+                            !CloverNT::Utils::System::IsPathInside(entryPath, directory) ||
+                            !std::filesystem::exists(entryPath, ec) || ec) {
+        return unexpected(
+                makeError(ErrorCategory::Plugin, CommonErrorCode::NotFound, "invalid entry path: " + manifest.entry));
+    }
+
+    const std::string name   = manifest.name;
+    auto              plugin = std::make_shared<Plugin::NativePlugin>(std::move(manifest), directory, entryPath);
+    plugin->setState(Plugin::PluginState::Loading);
+
+    const auto fail = [&](std::string reason, const CommonErrorCode code) -> std::unexpected<Error> {
+        (void) plugin->mLibrary.close();
+        Platform::discardNativeImage(plugin->mImageDirectory);
+        plugin->mImageDirectory.clear();
+        plugin->setState(Plugin::PluginState::Failed);
+        return unexpected(makeError(ErrorCategory::Plugin, code, std::move(reason)));
+    };
+
+    auto image = Platform::loadNativeImage(plugin->mLibrary, name, plugin->entryPath(), plugin->directory());
+    if (!image) {
+        return fail("failed to load library: " + image.error().message, CommonErrorCode::OperationFailed);
+    }
+    plugin->mImageDirectory = std::move(image.value());
+
+    auto loadCallback = plugin->mLibrary.getSymbol<Plugin::NativePlugin::Callback>("clovernt_plugin_load");
+    if (!loadCallback) {
+        return fail("does not export clovernt_plugin_load: " + loadCallback.error().message, CommonErrorCode::NotFound);
+    }
+    plugin->mLoadCallback = loadCallback.value();
+
+    std::string failure;
+    try {
+        CurrentPluginScope currentPlugin(plugin);
+        if (!guardVeh([&] { return plugin->mLoadCallback(*plugin); })) {
+            failure = "load callback failed";
+        }
+    } catch (const std::exception& e) {
+        failure = std::string("load callback threw: ") + e.what();
+    } catch (...) {
+        failure = "load callback threw an unknown exception";
+    }
+    if (!failure.empty()) {
+        if (auto runtime = hookRuntime()) {
+            (void) runtime->get().clearPluginResources(name);
+        }
+        (void) Event::EventBus::clearPlugin(name);
+        (void) Event::EventBus::waitPluginIdle(name);
+        return fail(std::move(failure), CommonErrorCode::CallbackFailed);
+    }
+
+    plugin->setUnloadable(plugin->hasUnloadHandler());
+    return plugin;
+}
+
+void PluginRuntime::commitNativePlugin(std::shared_ptr<Plugin::NativePlugin> const& plugin) {
+    std::lock_guard   lock(mMutex);
+    const std::string name(plugin->name());
+    plugin->setState(Plugin::PluginState::Loaded);
+    mLoadedPlugins.insert_or_assign(name, plugin);
+    mLoadOrder.emplace_back(name);
+    mManifests.insert_or_assign(name, ManifestEntry{plugin->manifest(), plugin->directory()});
 }
 
 void PluginRuntime::drainPendingExternal() {
@@ -875,6 +903,11 @@ auto PluginRuntime::teardownPlugin(std::shared_ptr<Plugin::Plugin> const& plugin
     const std::string name(plugin->name());
     const auto        native = std::dynamic_pointer_cast<Plugin::NativePlugin>(plugin);
 
+    if (native && !finalShutdown && runsInModuleOf(reinterpret_cast<const void*>(native->mLoadCallback))) {
+        return unexpected(makePluginError(name + " cannot be unloaded while the calling thread is running its code",
+                                          CommonErrorCode::InvalidState));
+    }
+
     std::shared_ptr<Plugin::PluginLoader> externalLoader;
     if (!native) {
         if (const auto category = categoryOf(plugin->manifest().type); category != "clover" && category != "cloverjs") {
@@ -985,8 +1018,15 @@ auto PluginRuntime::teardownPlugin(std::shared_ptr<Plugin::Plugin> const& plugin
 
     if (native) {
         if (cleanupOk) {
+            const auto* probe = reinterpret_cast<const void*>(native->mLoadCallback);
             if (auto closed = native->mLibrary.close(); !closed) {
                 appendError(errors, name + " failed to free library: " + closed.error().message);
+            } else if (Utils::System::GetModuleHandleOf(probe) != nullptr) {
+                appendError(errors,
+                            name + " library stays loaded after being freed; something else still references it");
+            } else {
+                Platform::discardNativeImage(native->mImageDirectory);
+                native->mImageDirectory.clear();
             }
         } else if (finalShutdown) {
             native->mLibrary.releaseWithoutClose();
@@ -1123,7 +1163,8 @@ auto PluginRuntime::reloadPlugin(const std::string_view name) -> Expected<void> 
         return {};
     }
 
-    std::shared_ptr<Plugin::JsPlugin> js;
+    std::shared_ptr<Plugin::JsPlugin>     js;
+    std::shared_ptr<Plugin::NativePlugin> native;
     {
         std::lock_guard lock(mMutex);
         const auto      pluginIt = mLoadedPlugins.find(pluginName);
@@ -1133,12 +1174,13 @@ auto PluginRuntime::reloadPlugin(const std::string_view name) -> Expected<void> 
         if (pluginName == CorePluginName || pluginIt->second->isBuiltin()) {
             return unexpected(makePluginError("CloverCore cannot be reloaded", CommonErrorCode::Unsupported));
         }
-        js = std::dynamic_pointer_cast<Plugin::JsPlugin>(pluginIt->second);
-        if (!js) {
-            return unexpected(
-                    makePluginError(pluginName + " only JS plugins support reload", CommonErrorCode::Unsupported));
+        js     = std::dynamic_pointer_cast<Plugin::JsPlugin>(pluginIt->second);
+        native = std::dynamic_pointer_cast<Plugin::NativePlugin>(pluginIt->second);
+        if (!js && !native) {
+            return unexpected(makePluginError(pluginName + " only JS and native plugins support reload",
+                                              CommonErrorCode::Unsupported));
         }
-        if (js->state() != Plugin::PluginState::Loaded) {
+        if (pluginIt->second->state() != Plugin::PluginState::Loaded) {
             return unexpected(makePluginError(pluginName + " is not in Loaded state", CommonErrorCode::InvalidState));
         }
         for (auto const& [otherName, otherPlugin]: mLoadedPlugins) {
@@ -1148,7 +1190,18 @@ auto PluginRuntime::reloadPlugin(const std::string_view name) -> Expected<void> 
                         CommonErrorCode::InvalidState));
             }
         }
-        js->setState(Plugin::PluginState::Loading);
+        if (native && !native->hasUnloadHandler()) {
+            return unexpected(
+                    makePluginError(pluginName + " does not support hot reload because it defines no unload()",
+                                    CommonErrorCode::Unsupported));
+        }
+        if (js) {
+            js->setState(Plugin::PluginState::Loading);
+        }
+    }
+
+    if (native) {
+        return reloadNativePlugin(native);
     }
 
     auto result = mJs->reloadPlugin(pluginName);
@@ -1168,6 +1221,46 @@ auto PluginRuntime::reloadPlugin(const std::string_view name) -> Expected<void> 
         js->setState(Plugin::PluginState::Loaded);
     }
     logInfo(pluginName + " reloaded");
+    return {};
+}
+
+auto PluginRuntime::reloadNativePlugin(std::shared_ptr<Plugin::NativePlugin> const& plugin) -> Expected<void> {
+    const std::string name(plugin->name());
+    const auto        directory = plugin->directory();
+
+    auto manifest = Resolver::loadManifest(directory);
+    if (!manifest) {
+        return unexpected(
+                makePluginError(name + " manifest error: " + manifest.error().message, CommonErrorCode::ParseFailed));
+    }
+    if (manifest->type != "native") {
+        return unexpected(makePluginError(name + " is no longer a native plugin; unload it and load it again",
+                                          CommonErrorCode::Unsupported));
+    }
+    if (!Resolver::supportsPlatform(*manifest)) {
+        return unexpected(makePluginError(name + " does not support this platform", CommonErrorCode::Unsupported));
+    }
+    {
+        std::lock_guard lock(mMutex);
+        for (const auto& dependency: manifest->dependencies | std::views::keys) {
+            if (!mLoadedPlugins.contains(dependency)) {
+                return unexpected(makePluginError(std::format("{} is missing dependency {}", name, dependency),
+                                                  CommonErrorCode::InvalidState));
+            }
+        }
+    }
+
+    if (auto torn = teardownPlugin(plugin, /*recoverable*/ true, /*finalShutdown*/ false); !torn) {
+        return unexpected(torn.error());
+    }
+    auto loaded = loadNativePlugin(std::move(manifest.value()), directory);
+    if (!loaded) {
+        return unexpected(
+                makePluginError(name + " reload failed and the plugin stays unloaded: " + loaded.error().message,
+                                CommonErrorCode::CallbackFailed));
+    }
+    commitNativePlugin(loaded.value());
+    logInfo(name + " reloaded");
     return {};
 }
 
@@ -1224,16 +1317,26 @@ auto PluginRuntime::loadPlugin(std::string_view name) -> Expected<void> {
         pluginsDirectory = mPluginsDirectory;
     }
 
-    const auto pluginDirectory = pluginsDirectory / pluginName;
-    auto       manifestResult  = Resolver::loadManifest(pluginDirectory);
+    std::error_code directoryEc;
+    const auto      pluginDirectory =
+            std::filesystem::absolute(pluginsDirectory / pluginName, directoryEc).lexically_normal();
+    if (directoryEc) {
+        return unexpected(makePluginError(pluginName + " invalid directory: " + directoryEc.message(),
+                                          CommonErrorCode::InvalidArgument));
+    }
+    auto manifestResult = Resolver::loadManifest(pluginDirectory);
     if (!manifestResult) {
         return unexpected(makePluginError(pluginName + " manifest error: " + manifestResult.error().message,
                                           CommonErrorCode::ParseFailed));
     }
     auto manifest = std::move(manifestResult.value());
-    if (manifest.type != "js") {
+    if (manifest.type != "js" && manifest.type != "native") {
+        return unexpected(makePluginError(pluginName + " only JS and native plugins support hot load",
+                                          CommonErrorCode::Unsupported));
+    }
+    if (manifest.type == "native" && !Resolver::supportsPlatform(manifest)) {
         return unexpected(
-                makePluginError(pluginName + " only JS plugins support hot load", CommonErrorCode::Unsupported));
+                makePluginError(pluginName + " does not support this platform", CommonErrorCode::Unsupported));
     }
 
     {
@@ -1244,6 +1347,17 @@ auto PluginRuntime::loadPlugin(std::string_view name) -> Expected<void> {
                                                   CommonErrorCode::InvalidState));
             }
         }
+    }
+
+    if (manifest.type == "native") {
+        auto loaded = loadNativePlugin(std::move(manifest), pluginDirectory);
+        if (!loaded) {
+            return unexpected(makePluginError(pluginName + " load failed: " + loaded.error().message,
+                                              CommonErrorCode::CallbackFailed));
+        }
+        commitNativePlugin(loaded.value());
+        logInfo("Loaded " + pluginLabel(pluginName, loaded.value()->manifest().version));
+        return {};
     }
 
     auto built = makeJsPlugin(std::move(manifest), pluginDirectory);

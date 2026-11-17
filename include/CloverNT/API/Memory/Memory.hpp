@@ -463,6 +463,7 @@ namespace Detail {
                                                      std::string_view                     importModule,
                                                      std::string_view                     functionName,
                                                      Address                              detour,
+                                                     int                                  priority,
                                                      void**                               originalSlot,
                                                      const std::weak_ptr<Plugin::Plugin>& owner,
                                                      std::shared_ptr<ResourcePayload> payload) -> Expected<ResourceId>;

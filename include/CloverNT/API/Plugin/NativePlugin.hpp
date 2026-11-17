@@ -35,6 +35,7 @@ private:
     Utils::DynamicLibrary mLibrary;
     Callback              mLoadCallback{};
     UnloadFn              mUnloadFn{};
+    std::filesystem::path mImageDirectory;
 
     friend void setUnloadHandler(NativePlugin& plugin, UnloadFn fn) noexcept;
     friend class PluginManager;

@@ -35,6 +35,7 @@ public:
                                         std::string_view                                 importModule,
                                         std::string_view                                 functionName,
                                         Memory::Address                                  detour,
+                                        int                                              priority,
                                         void**                                           originalSlot,
                                         const std::weak_ptr<Plugin::Plugin>&             owner,
                                         std::shared_ptr<Memory::Detail::ResourcePayload> payload)

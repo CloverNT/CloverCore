@@ -27,6 +27,10 @@ namespace {
         errors += message;
     }
 
+    [[nodiscard]] constexpr auto dispatchRank(const Event::EventPriority priority) noexcept -> int {
+        return priority == Event::EventPriority::Monitor ? -1 : static_cast<int>(priority);
+    }
+
     class ThreadActivePluginScope {
     public:
         explicit ThreadActivePluginScope(std::string pluginName) : mPluginName(std::move(pluginName)) {
@@ -89,8 +93,9 @@ void EventRuntime::ListenerActivity::reset() noexcept {
 }
 
 bool EventRuntime::ListenerComparator::operator()(Event::ListenerPtr const& lhs, Event::ListenerPtr const& rhs) const {
-    if (lhs->priority() != rhs->priority()) {
-        return static_cast<int>(lhs->priority()) > static_cast<int>(rhs->priority());
+    if (const auto lhsRank = dispatchRank(lhs->priority()), rhsRank = dispatchRank(rhs->priority());
+        lhsRank != rhsRank) {
+        return lhsRank > rhsRank;
     }
     return lhs->id() < rhs->id();
 }
@@ -366,6 +371,11 @@ void EventRuntime::publish(Event::Event& event, const std::string_view eventName
     } holdGuard{releaseHolds};
 
     for (auto const& listener: listeners) {
+        if (cancellable != nullptr && cancellable->isCancelled() &&
+            listener->priority() != Event::EventPriority::Monitor) {
+            continue;
+        }
+
         std::optional<ListenerActivity> activity;
         try {
             activity = beginListenerActivity(listener);
@@ -384,10 +394,6 @@ void EventRuntime::publish(Event::Event& event, const std::string_view eventName
 
         if (!activity) {
             continue;
-        }
-
-        if (cancellable != nullptr && cancellable->isCancelled()) {
-            break;
         }
 
         try {

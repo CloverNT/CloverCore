@@ -2,6 +2,7 @@
 #include <CloverNT/API/Events/NamedEvent.hpp>
 #include <CloverNT/API/Nt/Packet.hpp>
 #include <CloverNT/API/Plugin/JsPlugin.hpp>
+#include <CloverNT/API/Plugin/NativePlugin.hpp>
 #include <CloverNT/API/Plugin/PluginManager.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/AlkaBindings.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Binding.hpp>
@@ -147,6 +148,16 @@ auto PluginManagerApi::scan() const -> std::vector<PluginScanDto> {
         }
         dto.passive = passive;
         dto.loaded  = loaded;
+        if (loaded) {
+            const auto colon = name.find(':');
+            const auto bare =
+                    colon == std::string::npos ? std::string_view{name} : std::string_view{name}.substr(colon + 1);
+            if (const auto plugin = Plugin::PluginManager::getPlugin(bare)) {
+                const auto native = std::dynamic_pointer_cast<Plugin::NativePlugin>(plugin);
+                dto.unloadable    = native ? native->hasUnloadHandler() : plugin->isUnloadable();
+                dto.builtin       = plugin->isBuiltin();
+            }
+        }
         out.push_back(std::move(dto));
     }
     return out;
@@ -160,6 +171,35 @@ bool PluginManagerApi::unload(const std::string& name) const {
 }
 bool PluginManagerApi::reload(const std::string& name) const {
     return Plugin::PluginManager::reloadPlugin(name).has_value();
+}
+
+auto PluginManagerApi::loadWithResult(const std::string& name) const -> PluginActionResultDto {
+    if (const auto result = Plugin::PluginManager::loadPlugin(name); !result) {
+        return {.ok = false, .error = result.error().message};
+    }
+    return {.ok = true};
+}
+
+auto PluginManagerApi::unloadWithResult(const std::string& name) const -> PluginActionResultDto {
+    if (const auto result = Plugin::PluginManager::unloadPlugin(name); !result) {
+        return {.ok = false, .error = result.error().message};
+    }
+    return {.ok = true};
+}
+
+auto PluginManagerApi::reloadWithResult(const std::string& name) const -> PluginActionResultDto {
+    if (const auto result = Plugin::PluginManager::reloadPlugin(name); !result) {
+        return {.ok = false, .error = result.error().message};
+    }
+    return {.ok = true};
+}
+
+auto PluginManagerApi::rescanWithResult() const -> PluginActionResultDto {
+    const auto result = Plugin::PluginManager::rescan();
+    if (!result) {
+        return {.ok = false, .error = result.error().message};
+    }
+    return {.ok = true, .count = static_cast<double>(result.value())};
 }
 
 bool PluginManagerApi::registerLoader(std::string id, const Alka::Object& config) const {
@@ -185,12 +225,16 @@ bool PluginManagerApi::unregisterLoader(std::string id) const {
     return result.has_value();
 }
 
-auto EventsApi::on(std::string name, Alka::Function<void(Alka::Value)> callback) -> double {
-    return subscribe(std::move(name), std::move(callback), false);
+auto EventsApi::on(std::string                          name,
+                   Alka::Function<void(Alka::Value)>    callback,
+                   const Event::EventPriority priority) -> double {
+    return subscribe(std::move(name), std::move(callback), false, priority);
 }
 
-auto EventsApi::once(std::string name, Alka::Function<void(Alka::Value)> callback) -> double {
-    return subscribe(std::move(name), std::move(callback), true);
+auto EventsApi::once(std::string                          name,
+                     Alka::Function<void(Alka::Value)>    callback,
+                     const Event::EventPriority priority) -> double {
+    return subscribe(std::move(name), std::move(callback), true, priority);
 }
 
 auto EventsApi::off(const double id) -> bool {
@@ -214,7 +258,10 @@ auto EventsApi::emit(std::string name, const Alka::Value& payload) -> bool {
     return event.isCancelled();
 }
 
-auto EventsApi::subscribe(std::string name, Alka::Function<void(Alka::Value)> callback, const bool once) -> double {
+auto EventsApi::subscribe(std::string                          name,
+                          Alka::Function<void(Alka::Value)>    callback,
+                          const bool                           once,
+                          const CloverNT::Event::EventPriority priority) -> double {
     if (mState == nullptr || !callback.valid()) {
         return -1;
     }
@@ -230,8 +277,7 @@ auto EventsApi::subscribe(std::string name, Alka::Function<void(Alka::Value)> ca
     const std::string        key          = nativeExport != nullptr ? std::string(nativeExport->busKey) : name;
     (void) Event::EventBus::registerEvent(key, Plugin::PluginManager::getPlugin("CloverCore"));
 
-    auto listener =
-            std::make_shared<JsListener>(mState->mEventChannel, nativeExport, Event::EventPriority::Normal, owner);
+    auto                listener = std::make_shared<JsListener>(mState->mEventChannel, nativeExport, priority, owner);
     const std::uint64_t subId = listener->id();
     if (auto result = Event::EventBus::addListener(listener, key); !result) {
         return -1;
@@ -350,6 +396,7 @@ void ensureAlkaClasses(v8::Isolate* isolate) {
                         PacketApi,
                         PluginListDto,
                         PluginScanDto,
+                        PluginActionResultDto,
                         Nt::Packet,
                         Nt::Credential>(isolate);
 }

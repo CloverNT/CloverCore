@@ -138,6 +138,17 @@ void ElectronRuntime::onElectronReady(JsRuntime::State&           state,
     }
 
     registerShutdownHook(state);
+
+    if (std::error_code ec;
+        std::filesystem::exists(state.mCoreDir / "framework" / "clovernt-main.js", ec) && !ec) {
+        const auto         mainScript = state.mCoreDir / "framework" / "clovernt-main.js";
+        const v8::TryCatch tryCatch(isolate);
+        if (state.requireModule(context, mainScript.string()).IsEmpty()) {
+            JsRuntime::State::logger().error("clovernt-main.js failed to load: {}",
+                                             describeException(isolate, context, tryCatch));
+        }
+    }
+
     driveJsLoad(state);
 }
 
@@ -158,6 +169,14 @@ void ElectronRuntime::rendererEntries(const v8::FunctionCallbackInfo<v8::Value>&
                 }
             }
             std::uint32_t index = 0;
+            if (std::error_code ec;
+                std::filesystem::exists(state->mCoreDir / "framework" / "clovernt-renderer.js", ec) && !ec) {
+                const auto uiScript = state->mCoreDir / "framework" / "clovernt-renderer.js";
+                const auto entry    = v8::Object::New(isolate);
+                setProp(context, entry, "name", v8Str(isolate, "clovernt-ui"));
+                setProp(context, entry, "source", v8Str(isolate, readFileUtf8(uiScript)));
+                (void) array->Set(context, index++, entry);
+            }
             for (auto const& [name, path]: entries) {
                 const auto entry = v8::Object::New(isolate);
                 setProp(context, entry, "name", v8Str(isolate, name));

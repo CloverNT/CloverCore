@@ -5,7 +5,6 @@
 #include <ranges>
 #include <utility>
 
-#include <Mortis/Detail/ImportHookImpl.hpp>
 #include <Mortis/Process.hpp>
 
 namespace CloverNT::Core::Modules {
@@ -179,7 +178,7 @@ namespace {
     private:
         auto enableImpl() -> Expected<void> override {
             const CloverHook handle =
-                    CloverHookInline(reinterpret_cast<CloverAddress>(mTarget), mDetour, mOriginalSlot);
+                    CloverHookInline(reinterpret_cast<CloverAddress>(mTarget), mDetour, mPriority, mOriginalSlot);
             if (handle == 0) {
                 return unexpected(
                         Memory::makeMemoryError(Memory::ErrorCode::HookInstallFailed, "Inline hook install failed"));
@@ -201,11 +200,11 @@ namespace {
             return {};
         }
 
-        void*                mTarget{};
-        void*                mDetour{};
-        [[maybe_unused]] int mPriority{};
-        void**               mOriginalSlot{};
-        CloverHook           mHandle{0};
+        void*      mTarget{};
+        void*      mDetour{};
+        int        mPriority{};
+        void**     mOriginalSlot{};
+        CloverHook mHandle{0};
     };
 
     class ImportHookResource final : public HookRuntime::RuntimeResource {
@@ -216,50 +215,41 @@ namespace {
                            std::string                                      importModule,
                            std::string                                      functionName,
                            const Memory::Address                            detour,
+                           const int                                        priority,
                            void**                                           originalSlot)
             : RuntimeResource(std::move(owner), std::move(payload)),
               mModuleName(std::move(moduleName)),
               mImportModule(std::move(importModule)),
               mFunctionName(std::move(functionName)),
               mDetour(reinterpret_cast<void*>(detour)),
+              mPriority(priority),
               mOriginalSlot(originalSlot) {}
 
     private:
         auto enableImpl() -> Expected<void> override {
-            void*      previous = nullptr;
-            const auto result   = Mortis::ImportHookImpl::PatchImportEntry(
-                    mModuleName, mImportModule, mFunctionName, mDetour, &previous);
-            if (!result) {
-                auto        code    = toErrorCode(result.code());
-                std::string message = result.error();
-                if (previous != nullptr) {
-                    if (const auto rollback = Mortis::ImportHookImpl::UnpatchImportEntry(
-                                mModuleName, mImportModule, mFunctionName, previous);
-                        !rollback) {
-                        code = Memory::ErrorCode::HookInstallFailed;
-                        appendError(message, "Rollback failed after import patch failure: " + rollback.error());
-                    }
-                }
-                return unexpected(Memory::makeMemoryError(code, std::move(message)));
+            const CloverHook handle = CloverHookImport(mModuleName.c_str(),
+                                                       mImportModule.c_str(),
+                                                       mFunctionName.c_str(),
+                                                       mDetour,
+                                                       mPriority,
+                                                       mOriginalSlot);
+            if (handle == 0) {
+                return unexpected(
+                        Memory::makeMemoryError(Memory::ErrorCode::HookInstallFailed, "Import hook install failed"));
             }
-            if (mOriginal == nullptr) {
-                mOriginal = previous;
-            }
-            if (mOriginalSlot != nullptr) {
-                *mOriginalSlot = mOriginal;
-            }
+            mHandle = handle;
             return {};
         }
 
         auto disableImpl() -> Expected<void> override {
-            if (mOriginal == nullptr) {
+            if (mHandle == 0) {
                 return {};
             }
-            if (const auto result = Mortis::ImportHookImpl::UnpatchImportEntry(
-                        mModuleName, mImportModule, mFunctionName, mOriginal);
-                !result) {
-                return unexpected(Memory::makeMemoryError(toErrorCode(result.code()), result.error()));
+            if (CloverHookRemove(mHandle) == 0) {
+                return unexpected(
+                        Memory::makeMemoryError(Memory::ErrorCode::HookRemoveFailed, "Import hook remove failed"));
             }
+            mHandle = 0;
             return {};
         }
 
@@ -267,8 +257,9 @@ namespace {
         std::string mImportModule;
         std::string mFunctionName;
         void*       mDetour{};
-        void*       mOriginal{};
+        int         mPriority{};
         void**      mOriginalSlot{};
+        CloverHook  mHandle{0};
     };
 
     class PatchResource final : public HookRuntime::RuntimeResource {
@@ -517,6 +508,7 @@ auto HookRuntime::createImportHook(const std::string_view                       
                                    const std::string_view                           importModule,
                                    const std::string_view                           functionName,
                                    Memory::Address                                  detour,
+                                   const int                                        priority,
                                    void**                                           originalSlot,
                                    const std::weak_ptr<Plugin::Plugin>&             owner,
                                    std::shared_ptr<Memory::Detail::ResourcePayload> payload)
@@ -536,6 +528,7 @@ auto HookRuntime::createImportHook(const std::string_view                       
                                                          std::string(importModule),
                                                          std::string(functionName),
                                                          detour,
+                                                         priority,
                                                          originalSlot);
     return addResource(std::move(resource));
 }

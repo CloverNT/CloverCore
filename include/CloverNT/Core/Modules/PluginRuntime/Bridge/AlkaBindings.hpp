@@ -1,4 +1,5 @@
 #pragma once
+#include <CloverNT/API/Events/Listener.hpp>
 #include <CloverNT/API/Logger.hpp>
 #include <CloverNT/API/Nt/Packet.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/JsRuntime.hpp>
@@ -65,6 +66,13 @@ struct PluginScanDto {
     std::optional<std::string> description;
     bool                       passive{};
     bool                       loaded{};
+    bool                       unloadable{};
+    bool                       builtin{};
+};
+struct PluginActionResultDto {
+    bool                       ok{};
+    std::optional<std::string> error;
+    double                     count{};
 };
 
 class PluginManagerApi {
@@ -76,6 +84,10 @@ public:
     bool               load(const std::string& name) const;
     bool               unload(const std::string& name) const;
     bool               reload(const std::string& name) const;
+    [[nodiscard]] auto loadWithResult(const std::string& name) const -> PluginActionResultDto;
+    [[nodiscard]] auto unloadWithResult(const std::string& name) const -> PluginActionResultDto;
+    [[nodiscard]] auto reloadWithResult(const std::string& name) const -> PluginActionResultDto;
+    [[nodiscard]] auto rescanWithResult() const -> PluginActionResultDto;
     bool               registerLoader(std::string id, const Alka::Object& config) const;
     bool               unregisterLoader(std::string id) const;
 
@@ -88,13 +100,19 @@ public:
     EventsApi(JsRuntime::State* state, std::string ownerName) noexcept
         : mState(state), mOwnerName(std::move(ownerName)) {}
 
-    [[nodiscard]] auto on(std::string name, Alka::Function<void(Alka::Value)> callback) -> double;
-    [[nodiscard]] auto once(std::string name, Alka::Function<void(Alka::Value)> callback) -> double;
+    [[nodiscard]] auto
+    on(std::string name, Alka::Function<void(Alka::Value)> callback, Event::EventPriority priority) -> double;
+    [[nodiscard]] auto once(std::string                       name,
+                            Alka::Function<void(Alka::Value)> callback,
+                            Event::EventPriority    priority) -> double;
     [[nodiscard]] auto off(double id) -> bool;
     [[nodiscard]] auto emit(std::string name, const Alka::Value& payload) -> bool;
 
 private:
-    [[nodiscard]] auto subscribe(std::string name, Alka::Function<void(Alka::Value)> callback, bool once) -> double;
+    [[nodiscard]] auto subscribe(std::string                       name,
+                                 Alka::Function<void(Alka::Value)> callback,
+                                 bool                              once,
+                                 Event::EventPriority    priority) -> double;
 
     JsRuntime::State* mState;
     std::string       mOwnerName;
@@ -139,12 +157,14 @@ struct Alka::Bind<CloverNT::Core::Modules::bridge::CloverntModule> : Module<"clo
     static constexpr auto doc     = "CloverNT plugin runtime API (auto-generated from the native bindings).";
     static constexpr auto members = Alka::members(Alka::enumType<CloverNT::LogLevel>(),
                                                   Alka::enumType<CloverNT::Nt::Encryption>(),
+                                                  Alka::enumType<CloverNT::Event::EventPriority>(),
                                                   Alka::type<CloverNT::Core::Modules::bridge::JsLogger>,
                                                   Alka::type<CloverNT::Core::Modules::bridge::PluginManagerApi>,
                                                   Alka::type<CloverNT::Core::Modules::bridge::EventsApi>,
                                                   Alka::type<CloverNT::Core::Modules::bridge::PacketApi>,
                                                   Alka::type<CloverNT::Core::Modules::bridge::PluginListDto>,
                                                   Alka::type<CloverNT::Core::Modules::bridge::PluginScanDto>,
+                                                  Alka::type<CloverNT::Core::Modules::bridge::PluginActionResultDto>,
                                                   Alka::type<CloverNT::Nt::Packet>,
                                                   Alka::type<CloverNT::Nt::Credential>);
 };
@@ -181,6 +201,10 @@ struct Alka::Bind<CloverNT::Core::Modules::bridge::PluginManagerApi>
                                                   Alka::method<&P::load>(arg("name")),
                                                   Alka::method<&P::unload>(arg("name")),
                                                   Alka::method<&P::reload>(arg("name")),
+                                                  Alka::method<&P::loadWithResult>(arg("name")),
+                                                  Alka::method<&P::unloadWithResult>(arg("name")),
+                                                  Alka::method<&P::reloadWithResult>(arg("name")),
+                                                  Alka::method<&P::rescanWithResult>(),
                                                   Alka::method<&P::registerLoader>(arg("id"), arg("config")),
                                                   Alka::method<&P::unregisterLoader>(arg("id")));
 };
@@ -190,10 +214,13 @@ struct Alka::Bind<CloverNT::Core::Modules::bridge::EventsApi>
     : Class<CloverNT::Core::Modules::bridge::EventsApi, "Events"> {
     using E                       = CloverNT::Core::Modules::bridge::EventsApi;
     static constexpr auto doc     = "Bidirectional C++<->JS event bus.";
-    static constexpr auto members = Alka::members(Alka::method<&E::on>(arg("name"), arg("callback")),
-                                                  Alka::method<&E::once>(arg("name"), arg("callback")),
-                                                  Alka::method<&E::off>(arg("id")),
-                                                  Alka::method<&E::emit>(arg("name"), arg("payload")));
+    static constexpr auto members = Alka::members(
+            Alka::method<&E::on>(
+                    arg("name"), arg("callback"), arg("priority") = CloverNT::Event::EventPriority::Normal),
+            Alka::method<&E::once>(
+                    arg("name"), arg("callback"), arg("priority") = CloverNT::Event::EventPriority::Normal),
+            Alka::method<&E::off>(arg("id")),
+            Alka::method<&E::emit>(arg("name"), arg("payload")));
 };
 
 template <>
@@ -231,7 +258,19 @@ struct Alka::Bind<CloverNT::Core::Modules::bridge::PluginScanDto>
                                                   Alka::prop<&T::author>(readonly),
                                                   Alka::prop<&T::description>(readonly),
                                                   Alka::prop<&T::passive>(readonly),
-                                                  Alka::prop<&T::loaded>(readonly));
+                                                  Alka::prop<&T::loaded>(readonly),
+                                                  Alka::prop<&T::unloadable>(readonly),
+                                                  Alka::prop<&T::builtin>(readonly));
+};
+
+template <>
+struct Alka::Bind<CloverNT::Core::Modules::bridge::PluginActionResultDto>
+    : Class<CloverNT::Core::Modules::bridge::PluginActionResultDto, "PluginActionResult"> {
+    using T                       = CloverNT::Core::Modules::bridge::PluginActionResultDto;
+    static constexpr auto doc     = "Result of a plugin lifecycle or rescan operation.";
+    static constexpr auto members = Alka::members(Alka::prop<&T::ok>(readonly),
+                                                  Alka::prop<&T::error>(readonly),
+                                                  Alka::prop<&T::count>(readonly));
 };
 
 // A byte array (e.g. the 16-byte d2 key) crosses as a Uint8Array.

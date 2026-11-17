@@ -133,6 +133,8 @@ set(CLOVER_CORE_SOURCES
         $<$<PLATFORM_ID:Windows>:src/Core/Platform/NodeEnvironmentGate.Windows.cpp>
         $<$<PLATFORM_ID:Windows>:src/Core/Platform/DelayLoadCompat.Windows.cpp>
         $<$<PLATFORM_ID:Linux>:src/Core/Platform/NodeEnvironmentGate.Linux.cpp>
+        $<$<PLATFORM_ID:Windows>:src/Core/Platform/NativeImage.Windows.cpp>
+        $<$<PLATFORM_ID:Linux>:src/Core/Platform/NativeImage.Linux.cpp>
         src/Core/Memory/Memory.cpp
         src/Core/Plugin/JsPlugin.cpp
         src/Core/Plugin/NativePlugin.cpp
