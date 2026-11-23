@@ -307,6 +307,38 @@ bool PacketApi::ready() const {
     return Nt::ready();
 }
 
+bool PacketApi::guardAvailable() const {
+    return Nt::guardAvailable();
+}
+
+auto PacketApi::lockedFamilies() const -> std::uint32_t {
+    return Nt::lockedFamilies();
+}
+
+bool PacketApi::packetLocked() const {
+    return Nt::packetLocked();
+}
+
+bool PacketApi::credentialLocked() const {
+    return Nt::credentialLocked();
+}
+
+auto PacketApi::patchGuardState() const -> std::uint32_t {
+    return Nt::patchGuardState();
+}
+
+bool PacketApi::patchGuardActive() const {
+    return Nt::patchGuardActive();
+}
+
+bool PacketApi::patchGuardEnabledNext() const {
+    return Nt::patchGuardEnabledNext();
+}
+
+bool PacketApi::patchGuardRestartPending() const {
+    return Nt::patchGuardRestartPending();
+}
+
 auto PacketApi::credential() const -> std::optional<Nt::Credential> {
     return Nt::credential();
 }
@@ -425,6 +457,7 @@ auto mintEvents(const v8::Local<v8::Context> context, JsRuntime::State& state, c
 }
 
 void clearBindings(JsRuntime::State& state) {
+    LinkedBinding::cancelPendingGuardRequests(state);
     const std::lock_guard lock(gMutex);
     registry().erase(&state);
 }

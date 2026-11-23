@@ -1,18 +1,66 @@
 #include <CloverNT/API/Plugin/JsPlugin.hpp>
-#include <CloverNT/API/Plugin/PluginManager.hpp>
+#include <CloverNT/Core/Modules/Manager.hpp>
+#include <CloverNT/Core/Modules/PluginRuntime.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Binding.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Electron.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Lifecycle.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace CloverNT::Core::Modules::bridge {
+
+namespace {
+
+/** The origin of QQ's own pages; framework/src/shared/trust.ts holds the same value. */
+constexpr std::string_view kTrustedOrigin = "app://.";
+
+constexpr std::size_t kMaxLogScopeBytes   = 64;
+constexpr std::size_t kMaxLogMessageBytes = 8 * 1024;
+
+/** Whether an IPC event comes from one of QQ's own pages; a frame that navigated away or closed does not. */
+bool isTrustedSender(const v8::Local<v8::Context> context, const v8::Local<v8::Value> event) {
+    if (event.IsEmpty() || !event->IsObject()) {
+        return false;
+    }
+    const auto frame = getProp(context, event.As<v8::Object>(), "senderFrame");
+    if (frame.IsEmpty() || !frame->IsObject()) {
+        return false;
+    }
+    const auto origin = getProp(context, frame.As<v8::Object>(), "origin");
+    return !origin.IsEmpty() && origin->IsString() && toUtf8(v8::Isolate::GetCurrent(), origin) == kTrustedOrigin;
+}
+
+/** Text from a page for the log: no control characters, which could forge the log framing or lines, and at most `limit` bytes. */
+std::string loggable(std::string text, const std::size_t limit) {
+    std::erase_if(text, [](const unsigned char c) { return c < 0x20 || c == 0x7f; });
+    if (text.size() <= limit) {
+        return text;
+    }
+    text.resize(limit);
+    // Drop a UTF-8 sequence that the cut left incomplete.
+    std::size_t lead = text.size();
+    while (lead > 0 && (static_cast<unsigned char>(text[lead - 1]) & 0xC0) == 0x80) {
+        --lead;
+    }
+    if (lead > 0) {
+        const auto        byte   = static_cast<unsigned char>(text[lead - 1]);
+        const std::size_t length = byte < 0x80 ? 1 : byte >= 0xF0 ? 4 : byte >= 0xE0 ? 3 : 2;
+        if (text.size() - (lead - 1) < length) {
+            text.resize(lead - 1);
+        }
+    }
+    return text;
+}
+
+} // namespace
 
 void ElectronRuntime::installDetection(JsRuntime::State& state) {
     v8::Isolate* isolate = state.mIsolate;
@@ -109,7 +157,10 @@ void ElectronRuntime::onElectronReady(JsRuntime::State&           state,
 
     if (!state.mIpcMain.IsEmpty()) {
         const auto ipc = state.mIpcMain.Get(isolate);
-        invokeMethod(context, ipc, "on", {v8Str(isolate, "clovernt:log"), makeFn(context, &Logger::sink, ext)});
+        invokeMethod(context,
+                     ipc,
+                     "on",
+                     {v8Str(isolate, "clovernt:log"), makeFn(context, &ElectronRuntime::rendererLog, ext)});
         invokeMethod(
                 context,
                 ipc,
@@ -158,7 +209,8 @@ void ElectronRuntime::rendererEntries(const v8::FunctionCallbackInfo<v8::Value>&
         v8::Isolate* isolate = args.GetIsolate();
         const auto   context = isolate->GetCurrentContext();
         const auto   array   = v8::Array::New(isolate);
-        if (state != nullptr) {
+        // Pages other than QQ's own get no renderer code, only the fonts the preload applies.
+        if (state != nullptr && args.Length() > 0 && isTrustedSender(context, args[0])) {
             std::vector<std::pair<std::string, std::filesystem::path>> entries;
             {
                 std::lock_guard lock(state->mMutex);
@@ -185,6 +237,24 @@ void ElectronRuntime::rendererEntries(const v8::FunctionCallbackInfo<v8::Value>&
             }
         }
         args.GetReturnValue().Set(array);
+    });
+}
+
+void ElectronRuntime::rendererLog(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    guardedCallback(args, [&] {
+        auto*        state   = dataOf<JsRuntime::State>(args);
+        v8::Isolate* isolate = args.GetIsolate();
+        const auto   context = isolate->GetCurrentContext();
+        // An ipcMain.on listener gets (event, level, scope, message).
+        if (state == nullptr || args.Length() < 4 || !isTrustedSender(context, args[0])) {
+            return;
+        }
+        const int level = std::clamp(args[1]->Int32Value(context).FromMaybe(static_cast<int>(LogLevel::Info)),
+                                     static_cast<int>(LogLevel::Debug),
+                                     static_cast<int>(LogLevel::Fatal));
+        const auto scope   = loggable(toUtf8(isolate, args[2]), kMaxLogScopeBytes);
+        const auto message = loggable(toUtf8(isolate, args[3]), kMaxLogMessageBytes);
+        state->resolveRendererLogger(scope.empty() ? "renderer" : scope)->log(static_cast<LogLevel>(level), message);
     });
 }
 
@@ -263,7 +333,12 @@ void ElectronRuntime::onAppQuitEvent(const v8::FunctionCallbackInfo<v8::Value>& 
         }
         CloverContext::setShuttingDown(true);
         JsRuntime::State::logger().info("Unloading plugins...");
-        if (auto result = Plugin::PluginManager::unloadAllPlugins(); !result) {
+        auto runtime = Manager::getInstance().requireModule<PluginRuntime>();
+        if (!runtime) {
+            JsRuntime::State::logger().error("shutdown plugin runtime unavailable: {}", runtime.error().message);
+            return;
+        }
+        if (auto result = runtime->get().unloadForProcessExit(); !result) {
             JsRuntime::State::logger().error("shutdown plugin unload reported errors: {}", result.error().message);
         }
     });
@@ -296,7 +371,8 @@ void ElectronRuntime::registerShutdownHook(JsRuntime::State& state) {
                  .ToLocal(&listener)) {
         return;
     }
-    v8::Local<v8::Value> onArgs[] = {v8::String::NewFromUtf8Literal(isolate, "before-quit"), listener};
+    // The earlier before-quit and will-quit events can both be cancelled.
+    v8::Local<v8::Value> onArgs[] = {v8::String::NewFromUtf8Literal(isolate, "quit"), listener};
     if (onValue.As<v8::Function>()->Call(context, app, 2, onArgs).IsEmpty()) {
         JsRuntime::State::logger().error("shutdown hook registration failed: {}",
                                          describeException(isolate, context, tryCatch));

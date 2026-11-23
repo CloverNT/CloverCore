@@ -1,0 +1,406 @@
+#app:has(.setting-main > .wrapper:not([data-clovernt-hidden]) .about-container.clovernt-about-mounted) .window-title-bar,
+#app:has(.setting-main > .wrapper:not([data-clovernt-hidden]) .about-container.clovernt-about-mounted) .draggable-view__container {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    z-index: 20 !important;
+}
+
+.setting-main:has(> .wrapper:not([data-clovernt-hidden]) .about-container.clovernt-about-mounted) {
+    background-color: var(--bg_bottom_standard, #0f0f12) !important;
+    position: relative !important;
+    overflow: hidden !important;
+}
+body[q-theme="light"] .setting-main:has(> .wrapper:not([data-clovernt-hidden]) .about-container.clovernt-about-mounted) {
+    background-color: var(--bg_bottom_standard, #f0f0f2) !important;
+}
+
+.setting-main:has(> .wrapper:not([data-clovernt-hidden]) .about-container.clovernt-about-mounted) > .setting-title:not([data-clovernt-hidden]) {
+    display: none !important;
+}
+.setting-main:has(> .wrapper:not([data-clovernt-hidden]) .about-container.clovernt-about-mounted) > .wrapper:not([data-clovernt-hidden]) {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+}
+.setting-main:has(> .wrapper:not([data-clovernt-hidden]) .about-container.clovernt-about-mounted) > .wrapper:not([data-clovernt-hidden]) > .setting-main__content,
+.setting-main:has(> .wrapper:not([data-clovernt-hidden]) .about-container.clovernt-about-mounted) > .wrapper:not([data-clovernt-hidden]) > .setting-main__content > .q-scroll-view {
+    width: 100% !important;
+    height: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    overflow: hidden !important;
+}
+
+.about-container.clovernt-about-mounted {
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 0 !important;
+    position: relative !important;
+    overflow: hidden !important;
+}
+
+.clovernt-about {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+    color: var(--text_primary);
+    user-select: none;
+}
+
+.clovernt-about__polar-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    height: clamp(370px, 56vh, 430px);
+    display: block;
+    z-index: 0;
+    pointer-events: none;
+    -webkit-mask-image: linear-gradient(to bottom, #000000 0%, #000000 80%, transparent 100%);
+    mask-image: linear-gradient(to bottom, #000000 0%, #000000 80%, transparent 100%);
+}
+
+.clovernt-about__scroll {
+    position: absolute !important;
+    top: 32px !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100% !important;
+    height: calc(100% - 32px) !important;
+    z-index: 1;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    box-sizing: border-box;
+}
+
+.clovernt-about__content {
+    width: 100%;
+    min-height: 100%;
+    padding: 12px 32px 24px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 24px;
+}
+
+.clovernt-about__main {
+    width: 100%;
+    max-width: 580px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.clovernt-about__hero {
+    padding: 10px 0 22px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+}
+
+.clovernt-about__model-wrap {
+    position: relative;
+    width: 220px;
+    height: 176px;
+    flex-shrink: 0;
+}
+
+.clovernt-about__fallback-img {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 146px;
+    height: 146px;
+    transform: translate(-50%, -50%);
+    object-fit: contain;
+    pointer-events: none;
+    z-index: 1;
+    transition: opacity 0.24s ease;
+}
+.clovernt-about__fallback-img:not([src]),
+.clovernt-about__fallback-img.is-hidden {
+    opacity: 0;
+}
+
+.clovernt-about__model-canvas-wrap {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 300px;
+    height: 276px;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    z-index: 2;
+}
+.clovernt-about__model-canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.clovernt-about__model-stage {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    cursor: grab;
+    touch-action: none;
+    -webkit-app-region: no-drag;
+}
+.clovernt-about__model-stage:active {
+    cursor: grabbing;
+}
+
+.clovernt-about__wordmark {
+    width: 92px;
+    height: 31px;
+    margin-top: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    flex-shrink: 0;
+}
+.clovernt-about__wordmark-img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+    transition: opacity 0.18s ease;
+}
+.clovernt-about__wordmark-img:not([src]) {
+    opacity: 0;
+}
+
+.clovernt-about__version {
+    margin-top: 8px;
+    font-size: 13px;
+    line-height: 20px;
+    color: var(--text_secondary);
+    font-variant-numeric: tabular-nums;
+    user-select: text;
+}
+
+.clovernt-about__card {
+    width: 100%;
+    padding: 0 !important;
+    margin: 0 !important;
+    border-radius: 8px;
+    background-color: var(--fill_light_primary);
+    background-color: color-mix(in srgb, var(--fill_light_primary) 88%, transparent);
+    -webkit-backdrop-filter: blur(16px);
+    backdrop-filter: blur(16px);
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+.clovernt-about__row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    min-height: 48px;
+    padding: 13px 18px;
+    box-sizing: border-box;
+}
+.clovernt-about__row:not(:last-child)::after {
+    content: "";
+    position: absolute;
+    left: 18px;
+    right: 18px;
+    bottom: 0;
+    height: 1px;
+    background-color: var(--divider_standard, rgba(128, 128, 128, 0.1));
+    pointer-events: none;
+}
+.clovernt-about__row.is-clickable {
+    cursor: pointer;
+    transition: background-color 0.14s ease;
+}
+.clovernt-about__row.is-clickable:hover {
+    background-color: var(--overlay_hover);
+}
+.clovernt-about__row.is-clickable:active {
+    background-color: var(--overlay_pressed);
+}
+.clovernt-about__row-title {
+    flex: 1;
+    min-width: 0;
+    font-size: 14px;
+    line-height: 20px;
+    color: var(--text_primary);
+}
+.clovernt-about__row-tail {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    font-size: 13px;
+    line-height: 1;
+    color: var(--text_secondary);
+}
+.clovernt-about__env-toggle::after {
+    opacity: 0;
+    transition: opacity 0.16s ease;
+}
+.clovernt-about__env-toggle.is-expanded::after {
+    opacity: 1;
+}
+
+.clovernt-about__val {
+    font-size: 13px;
+    line-height: 18px;
+    color: var(--text_secondary);
+    font-variant-numeric: tabular-nums;
+    user-select: text;
+}
+
+.clovernt-about__ver-btn {
+    appearance: none;
+    border: none;
+    background: transparent;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 18px;
+    color: var(--text_secondary);
+    font-variant-numeric: tabular-nums;
+    padding: 3px 6px;
+    margin: -3px -6px;
+    border-radius: 4px;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.14s ease, color 0.14s ease;
+}
+.clovernt-about__ver-btn:hover {
+    background-color: var(--overlay_hover);
+    color: var(--text_primary);
+}
+.clovernt-about__ver-btn:active {
+    background-color: var(--overlay_pressed);
+}
+
+.clovernt-about__chevron {
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--icon_secondary, var(--text_secondary));
+    flex-shrink: 0;
+    transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.clovernt-about__chevron svg {
+    width: 16px;
+    height: 16px;
+    display: block;
+}
+.clovernt-about__env-toggle.is-expanded .clovernt-about__chevron {
+    transform: rotate(90deg);
+}
+
+/* Default-Collapsed Runtime Component Details */
+.clovernt-about__env-collapse {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.clovernt-about__env-collapse.is-expanded {
+    grid-template-rows: 1fr;
+}
+.clovernt-about__env-inner {
+    min-height: 0;
+    overflow: hidden;
+}
+.clovernt-about__env-list {
+    padding: 6px 18px 10px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    background-color: rgba(0, 0, 0, 0.14);
+}
+body[q-theme="light"] .clovernt-about__env-list {
+    background-color: rgba(0, 0, 0, 0.025);
+}
+.clovernt-about__env-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    min-height: 30px;
+    padding: 4px 0;
+    box-sizing: border-box;
+}
+.clovernt-about__env-label {
+    font-size: 13px;
+    line-height: 18px;
+    color: var(--text_secondary);
+}
+.clovernt-about__env-val {
+    font-size: 12.5px;
+    line-height: 18px;
+    color: var(--text_primary);
+    font-variant-numeric: tabular-nums;
+    user-select: text;
+}
+
+.clovernt-about__copyright {
+    color: var(--text_secondary);
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 16px;
+    text-align: center;
+    flex-shrink: 0;
+}
+.clovernt-about__copyright-line {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+.clovernt-about__agreement {
+    color: #4ea4ff;
+    cursor: pointer;
+    display: inline-block;
+    margin-left: 0;
+    text-decoration: none;
+    transition: opacity 0.14s ease;
+}
+body[q-theme="light"] .clovernt-about__agreement {
+    color: var(--text_link, #2d77e5);
+}
+.clovernt-about__agreement:hover {
+    opacity: 0.84;
+    text-decoration: underline;
+}
+.clovernt-about__nt-flag {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text_secondary);
+}
+.clovernt-about__nt-logo {
+    display: inline-block;
+    flex-shrink: 0;
+    width: 74px;
+    height: 24px;
+    margin: 0 6px;
+    background-position: 50% 50%;
+    background-size: contain;
+    background-repeat: no-repeat;
+}

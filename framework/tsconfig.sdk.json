@@ -9,6 +9,6 @@
   },
   "include": [],
   "files": [
-    "src/sdk.ts"
+    "src/sdk/index.ts"
   ]
 }

@@ -615,6 +615,22 @@ std::shared_ptr<Logger> JsRuntime::State::resolveLogger(const std::string& scope
     return loggerHandle(scope).logger;
 }
 
+std::shared_ptr<Logger> JsRuntime::State::resolveRendererLogger(const std::string& scope) {
+    constexpr std::size_t maxScopes = 256;
+    std::string           resolved  = scope;
+    {
+        std::lock_guard lock(mLoggerMutex);
+        if (!mRendererScopes.contains(scope)) {
+            if (mRendererScopes.size() < maxScopes) {
+                mRendererScopes.insert(scope);
+            } else {
+                resolved = "renderer";
+            }
+        }
+    }
+    return resolveLogger(resolved);
+}
+
 JsRuntime::JsRuntime(Callbacks callbacks) : mState(std::make_unique<State>(std::move(callbacks))) {}
 
 JsRuntime::~JsRuntime() = default;

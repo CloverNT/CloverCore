@@ -31,12 +31,21 @@ for (const f of [js, join(sdkDir, "index.d.ts"), resolve(args.license)]) {
         throw new Error(`missing ${f} (run \`npm run build\` first?)`);
     }
 }
-const declarations = readdirSync(sdkDir).filter((f) => f.endsWith(".d.ts"));
+// The publish job receives only the built artifact, with no framework dependencies installed.
+const available = new Set(readdirSync(sdkDir, {recursive: true}).filter((f) => f.endsWith(".d.ts")));
+const declarations = new Set(["index.d.ts"]);
+// Set iteration also visits declarations added while following local imports and re-exports.
 for (const f of declarations) {
-    for (const [, specifier] of readFileSync(join(sdkDir, f), "utf8").matchAll(/\bfrom\s+["'](\.{1,2}\/[^"']+)["']/g)) {
-        if (!declarations.includes(`${join(specifier).replace(/^\.[\\/]/, "")}.d.ts`)) {
+    const source = readFileSync(join(sdkDir, f), "utf8");
+    const references = /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?|\brequire\s*\(\s*|<reference\s+path\s*=\s*)["'](\.{1,2}\/[^"']+)["']/g;
+    for (const [, specifier] of source.matchAll(references)) {
+        const base = join(dirname(f), specifier);
+        const target = [base, base.replace(/\.js$/, "") + ".d.ts", join(base, "index.d.ts")]
+            .find((candidate) => available.has(candidate));
+        if (!target) {
             throw new Error(`${f} imports ${specifier}, which is not part of the package`);
         }
+        declarations.add(target);
     }
 }
 
@@ -55,7 +64,7 @@ const pkg = {
     license: "SEE LICENSE IN LICENSE",
     main: "index.js",
     types: "index.d.ts",
-    files: ["index.js", "*.d.ts", "LICENSE"],
+    files: ["index.js", "**/*.d.ts", "LICENSE"],
     repository: {type: "git", url: "git+https://github.com/CloverNT/CloverCore.git", directory: "framework"},
     peerDependencies: {electron: "*", "@types/node": "*"},
     peerDependenciesMeta: {electron: {optional: true}, "@types/node": {optional: true}},

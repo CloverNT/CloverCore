@@ -1,4 +1,14 @@
-import {LogLevel, type LogLevelValue} from "./bridge";
+import type {LogLevel as NativeLogLevel} from "../clovernt.gen";
+
+export const LogLevel = {
+    Debug: 0,
+    Info: 1,
+    Warning: 2,
+    Error: 3,
+    Fatal: 4,
+} as const satisfies Record<keyof typeof NativeLogLevel, NativeLogLevel>;
+
+export type LogLevelValue = (typeof LogLevel)[keyof typeof LogLevel];
 
 export interface CloverLogger {
     debug(message: string): void;

@@ -1,0 +1,57 @@
+.clovernt-panel {
+    width: 100%;
+}
+.clovernt-page {
+    display: flex;
+    flex-direction: column;
+    gap: var(--clovernt-group-gap);
+    width: 100%;
+    padding: var(--clovernt-page-padding);
+    box-sizing: border-box;
+}
+.clovernt-page button {
+    font-family: inherit;
+}
+
+.clovernt-pagehead {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin: 0 var(--clovernt-card-padding);
+}
+.clovernt-pagehead__desc {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--clovernt-text-caption);
+    line-height: 18px;
+    color: var(--text_secondary);
+}
+.clovernt-pagehead__owner {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    font-size: var(--clovernt-text-caption);
+    line-height: 18px;
+    color: var(--text_secondary);
+    white-space: nowrap;
+}
+
+.clovernt-slot {
+    display: flex;
+    flex-direction: column;
+    gap: var(--clovernt-group-gap);
+    min-width: 0;
+}
+.clovernt-page-error__detail {
+    margin-top: 6px;
+    color: var(--text_secondary);
+    white-space: pre-wrap;
+    word-break: break-all;
+    user-select: text;
+}
+.clovernt-page-error__hint {
+    margin-top: 6px;
+    color: var(--text_secondary);
+}

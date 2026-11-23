@@ -1,0 +1,35 @@
+[data-clovernt-hidden] {
+    display: none !important;
+}
+.clovernt-panel [hidden] {
+    display: none !important;
+}
+
+.nav-bar[data-clovernt-active] > .nav-item.nav-item-active:not(.clovernt-nav-item) {
+    background-color: transparent !important;
+    background: transparent !important;
+    color: var(--text_primary) !important;
+    font-weight: 400 !important;
+}
+.nav-bar[data-clovernt-active] > .nav-item.nav-item-active:not(.clovernt-nav-item) .icon,
+.nav-bar[data-clovernt-active] > .nav-item.nav-item-active:not(.clovernt-nav-item) .name {
+    color: var(--text_primary) !important;
+}
+.nav-bar[data-clovernt-active] > .nav-item.nav-item-active:not(.clovernt-nav-item):hover {
+    background-color: var(--overlay_hover) !important;
+}
+.nav-bar[data-clovernt-active] > .nav-item.nav-item-active:not(.clovernt-nav-item):active {
+    background-color: var(--overlay_pressed) !important;
+}
+
+.clovernt-toolbar .q-button {
+    margin-right: 0;
+    flex-shrink: 0;
+}
+.clovernt-issue .q-button {
+    margin-right: 0;
+}
+.clovernt-row__tail .q-switch,
+.clovernt-plugin-item__actions .q-switch {
+    margin-left: 8px;
+}

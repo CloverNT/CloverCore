@@ -1,17 +1,28 @@
+#include <CloverNT/API/Nt/Packet.hpp>
 #include <CloverNT/API/Plugin/JsPlugin.hpp>
 #include <CloverNT/API/Plugin/PluginManager.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/AlkaBindings.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Binding.hpp>
 #include <CloverNT/Runtime/Kernel.hpp>
+#include <CloverNT/Runtime/Nt.h>
 
+#include <atomic>
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_MSC_VER)
+    #define CLOVER_GUARD_NOINLINE __declspec(noinline)
+#else
+    #define CLOVER_GUARD_NOINLINE __attribute__((noinline))
+#endif
 
 #ifndef CLOVERNT_VERSION_FULL
     #define CLOVERNT_VERSION_FULL "0.0.0-unknown"
@@ -21,6 +32,134 @@ namespace CloverNT::Core::Modules::bridge {
 
 namespace {
     constexpr std::string_view kCoreVersion{CLOVERNT_VERSION_FULL};
+    constexpr std::int32_t     kGuardStatusSymbolMissing = -1;
+    constexpr std::int32_t     kGuardStatusUnavailable   = 8;
+
+    using CloverGuardSetLockedFn = std::int32_t(CloverNT_KERNEL_CALL*)(std::uint32_t families, CloverBool locked);
+
+    struct GuardCallOutcome {
+        std::int32_t                 status{kGuardStatusUnavailable};
+        std::optional<std::uint32_t> lockedMask;
+    };
+
+    [[nodiscard]] auto currentGuardMask() noexcept -> std::optional<std::uint32_t> {
+        if (!Nt::guardAvailable()) {
+            return std::nullopt;
+        }
+        return Nt::lockedFamilies();
+    }
+
+    [[nodiscard]] auto resolveGuardSetLocked() noexcept -> CloverGuardSetLockedFn {
+        static std::atomic<CloverGuardSetLockedFn> cached{nullptr};
+        if (auto* fn = cached.load(std::memory_order_acquire); fn != nullptr) {
+            return fn;
+        }
+        auto* fn = reinterpret_cast<CloverGuardSetLockedFn>(Nt::Detail::resolveLoaderSymbol("CloverSetLocked"));
+        if (fn != nullptr) {
+            cached.store(fn, std::memory_order_release);
+        }
+        return fn;
+    }
+
+    // Must remain a non-inlined function inside CloverCore so CloverLoader's RtlCaptureStackBackTrace /
+    // backtrace identifies CloverCore as the immediate external caller frame.
+    CLOVER_GUARD_NOINLINE auto callLoaderGuardSetLocked(const std::uint32_t families, const CloverBool locked) noexcept
+            -> GuardCallOutcome {
+        const auto fn = resolveGuardSetLocked();
+        if (fn == nullptr) {
+            return {.status = kGuardStatusSymbolMissing, .lockedMask = currentGuardMask()};
+        }
+        const std::int32_t status = fn(families, locked);
+        return {.status = status, .lockedMask = currentGuardMask()};
+    }
+
+    struct GuardAsyncTask {
+        std::mutex                        mutex;
+        JsRuntime::State*                 state{};
+        v8::Isolate*                      isolate{};
+        v8::Global<v8::Context>           context;
+        v8::Global<v8::Promise::Resolver> resolver;
+        uv_async_t*                       async{};
+        bool                              alive{true};
+        std::uint32_t                     families{};
+        CloverBool                        locked{};
+        std::int32_t                      status{kGuardStatusUnavailable};
+        std::optional<std::uint32_t>      lockedMask;
+    };
+
+    std::mutex                                      gPendingGuardMutex;
+    std::vector<std::shared_ptr<GuardAsyncTask>>    gPendingGuardTasks;
+
+    void closeGuardAsyncHandle(uv_async_t* handle) noexcept {
+        if (handle == nullptr) {
+            return;
+        }
+        uv_close(reinterpret_cast<uv_handle_t*>(handle), [](uv_handle_t* h) {
+            delete static_cast<std::shared_ptr<GuardAsyncTask>*>(h->data);
+            delete reinterpret_cast<uv_async_t*>(h);
+        });
+    }
+
+    auto makeGuardResultObject(v8::Isolate*                        isolate,
+                               const v8::Local<v8::Context>        context,
+                               const std::int32_t                  status,
+                               const std::optional<std::uint32_t>& lockedMask) -> v8::Local<v8::Object> {
+        const auto obj = v8::Object::New(isolate);
+        setProp(context, obj, "status", v8::Integer::New(isolate, status));
+        if (lockedMask.has_value()) {
+            setProp(context, obj, "lockedMask", v8::Integer::NewFromUnsigned(isolate, *lockedMask));
+        } else {
+            setProp(context, obj, "lockedMask", v8::Null(isolate));
+        }
+        return obj;
+    }
+
+    void onGuardAsyncDone(uv_async_t* handle) {
+        auto* holder = static_cast<std::shared_ptr<GuardAsyncTask>*>(handle->data);
+        if (holder == nullptr || !*holder) {
+            return;
+        }
+        const auto task = *holder;
+
+        v8::Isolate*                      isolate = nullptr;
+        v8::Global<v8::Context>           ctxGlobal;
+        v8::Global<v8::Promise::Resolver> resolverGlobal;
+        std::int32_t                      status = kGuardStatusUnavailable;
+        std::optional<std::uint32_t>      lockedMask;
+        uv_async_t*                       toClose = nullptr;
+        {
+            std::lock_guard lock(task->mutex);
+            if (!task->alive) {
+                return;
+            }
+            task->alive    = false;
+            toClose        = task->async;
+            task->async    = nullptr;
+            isolate        = task->isolate;
+            status         = task->status;
+            lockedMask     = task->lockedMask;
+            ctxGlobal      = std::move(task->context);
+            resolverGlobal = std::move(task->resolver);
+        }
+
+        {
+            std::lock_guard pendingLock(gPendingGuardMutex);
+            std::erase(gPendingGuardTasks, task);
+        }
+
+        if (isolate != nullptr && !ctxGlobal.IsEmpty() && !resolverGlobal.IsEmpty()) {
+            const v8::HandleScope    handleScope(isolate);
+            const auto               context = ctxGlobal.Get(isolate);
+            const v8::Context::Scope contextScope(context);
+            const auto               resultObj = makeGuardResultObject(isolate, context, status, lockedMask);
+            (void) resolverGlobal.Get(isolate)->Resolve(context, resultObj);
+            resolverGlobal.Reset();
+            ctxGlobal.Reset();
+        }
+
+        closeGuardAsyncHandle(toClose);
+    }
+
     std::string loaderVersionString() {
         return std::string{CloverNT::Runtime::Kernel::selfVersion()};
     }
@@ -75,6 +214,124 @@ void LinkedBinding::runEventLoopOnce(const v8::FunctionCallbackInfo<v8::Value>& 
     });
 }
 
+void LinkedBinding::getGuardLocked(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    guardedCallback(args, [&] {
+        v8::Isolate* isolate = args.GetIsolate();
+        if (const auto mask = currentGuardMask(); mask.has_value()) {
+            args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, *mask));
+        } else {
+            args.GetReturnValue().SetNull();
+        }
+    });
+}
+
+void LinkedBinding::setGuardLocked(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    guardedCallback(args, [&] {
+        v8::Isolate*                     isolate = args.GetIsolate();
+        const auto                       context = isolate->GetCurrentContext();
+        v8::Local<v8::Promise::Resolver> resolver;
+        if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
+            return;
+        }
+        args.GetReturnValue().Set(resolver->GetPromise());
+
+        auto*          state    = dataOf<JsRuntime::State>(args);
+        const uint32_t families = args.Length() > 0 ? args[0]->Uint32Value(context).FromMaybe(0u) : 0u;
+        const CloverBool locked = args.Length() > 1 && args[1]->BooleanValue(isolate) ? 1 : 0;
+
+        auto* loop = state != nullptr ? node::GetCurrentEventLoop(isolate) : nullptr;
+        if (state == nullptr || loop == nullptr) {
+            (void) resolver->Resolve(
+                    context, makeGuardResultObject(isolate, context, kGuardStatusUnavailable, currentGuardMask()));
+            return;
+        }
+
+        auto task      = std::make_shared<GuardAsyncTask>();
+        task->state    = state;
+        task->isolate  = isolate;
+        task->context.Reset(isolate, context);
+        task->resolver.Reset(isolate, resolver);
+        task->families = families;
+        task->locked   = locked;
+
+        auto* async  = new uv_async_t{};
+        async->data  = new std::shared_ptr<GuardAsyncTask>(task);
+        if (uv_async_init(loop, async, &onGuardAsyncDone) != 0) {
+            delete static_cast<std::shared_ptr<GuardAsyncTask>*>(async->data);
+            delete async;
+            task->resolver.Reset();
+            task->context.Reset();
+            (void) resolver->Resolve(
+                    context, makeGuardResultObject(isolate, context, kGuardStatusUnavailable, currentGuardMask()));
+            return;
+        }
+        task->async = async;
+
+        {
+            std::lock_guard pendingLock(gPendingGuardMutex);
+            gPendingGuardTasks.push_back(task);
+        }
+
+        try {
+            std::thread([task] {
+                const auto outcome = callLoaderGuardSetLocked(task->families, task->locked);
+                std::lock_guard lock(task->mutex);
+                task->status     = outcome.status;
+                task->lockedMask = outcome.lockedMask;
+                if (task->alive && task->async != nullptr) {
+                    (void) uv_async_send(task->async);
+                }
+            }).detach();
+        } catch (...) {
+            uv_async_t* toClose = nullptr;
+            {
+                std::lock_guard lock(task->mutex);
+                task->alive = false;
+                toClose     = task->async;
+                task->async = nullptr;
+                task->resolver.Reset();
+                task->context.Reset();
+            }
+            {
+                std::lock_guard pendingLock(gPendingGuardMutex);
+                std::erase(gPendingGuardTasks, task);
+            }
+            closeGuardAsyncHandle(toClose);
+            (void) resolver->Resolve(
+                    context, makeGuardResultObject(isolate, context, kGuardStatusUnavailable, currentGuardMask()));
+        }
+    });
+}
+
+void LinkedBinding::cancelPendingGuardRequests(JsRuntime::State& state) {
+    std::vector<std::shared_ptr<GuardAsyncTask>> toCancel;
+    {
+        std::lock_guard pendingLock(gPendingGuardMutex);
+        for (auto it = gPendingGuardTasks.begin(); it != gPendingGuardTasks.end();) {
+            if (*it && (*it)->state == &state) {
+                toCancel.push_back(std::move(*it));
+                it = gPendingGuardTasks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const auto& task: toCancel) {
+        uv_async_t* toClose = nullptr;
+        {
+            std::lock_guard lock(task->mutex);
+            if (task->alive) {
+                task->alive = false;
+                toClose     = task->async;
+                task->async = nullptr;
+                task->resolver.Reset();
+                task->context.Reset();
+            }
+        }
+        closeGuardAsyncHandle(toClose);
+    }
+}
+
 void LinkedBinding::registerBinding(const v8::Local<v8::Object>  exports,
                                     const v8::Local<v8::Value>   module,
                                     const v8::Local<v8::Context> context,
@@ -104,6 +361,8 @@ void LinkedBinding::registerBinding(const v8::Local<v8::Object>  exports,
         setProp(context, exports, "log", makeFn(context, &Logger::sink, external));
         setProp(context, exports, "createLogger", makeFn(context, &Logger::factory, external));
         setProp(context, exports, "runEventLoopOnce", makeFn(context, &LinkedBinding::runEventLoopOnce, external));
+        setProp(context, exports, "getGuardLocked", makeFn(context, &LinkedBinding::getGuardLocked, external));
+        setProp(context, exports, "setGuardLocked", makeFn(context, &LinkedBinding::setGuardLocked, external));
         setProp(context, exports, "pluginManager", PluginManager::instance(*state, context));
     } catch (const std::exception& exception) {
         JsRuntime::State::logger().error("clovernt linked binding registration failed: {}", exception.what());

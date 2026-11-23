@@ -48,6 +48,7 @@ public:
     [[nodiscard]] auto loadPlugin(std::string_view name) -> Expected<void>;
     [[nodiscard]] auto reloadPlugin(std::string_view name) -> Expected<void>;
     [[nodiscard]] auto unloadAll() -> Expected<void>;
+    [[nodiscard]] auto unloadForProcessExit() -> Expected<void>;
 
     [[nodiscard]] auto rescan() -> Expected<std::size_t>;
 
@@ -55,9 +56,10 @@ public:
     [[nodiscard]] auto unregisterLoader(std::string_view id) -> Expected<void>;
 
 private:
+    enum class TeardownMode { HotUnload, BulkUnload, RuntimeShutdown, ProcessExit };
+
     [[nodiscard]] auto teardownPlugin(std::shared_ptr<Plugin::Plugin> const& plugin,
-                                      bool                                   recoverable,
-                                      bool                                   finalShutdown) -> Expected<void>;
+                                      TeardownMode                           mode) -> Expected<void>;
     [[nodiscard]] auto loadNativePlugin(Plugin::Manifest manifest, std::filesystem::path const& directory)
             -> Expected<std::shared_ptr<Plugin::NativePlugin>>;
     [[nodiscard]] auto reloadNativePlugin(std::shared_ptr<Plugin::NativePlugin> const& plugin) -> Expected<void>;
@@ -65,7 +67,7 @@ private:
     [[nodiscard]] auto initializeState() -> Expected<void>;
     [[nodiscard]] auto loadConfiguredPlugins() -> Expected<void>;
     [[nodiscard]] auto unloadLoadedPlugins() -> Expected<void>;
-    [[nodiscard]] auto unloadLoadedPluginsImpl(bool finalShutdown) -> Expected<void>;
+    [[nodiscard]] auto unloadLoadedPluginsImpl(TeardownMode mode) -> Expected<void>;
     [[nodiscard]] auto clearState() -> Expected<void>;
 
     void onJsPluginResult(std::string_view name, bool ok, std::string_view error);

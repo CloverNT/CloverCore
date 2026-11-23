@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <QQNT/v8-cppgc.h>
@@ -90,6 +91,8 @@ struct JsRuntime::State {
     static auto        logger() -> Logger&;
     [[nodiscard]] auto loggerHandle(const std::string& scope) -> LoggerHandle&;
     [[nodiscard]] auto resolveLogger(const std::string& scope) -> std::shared_ptr<Logger>;
+    /** Like resolveLogger for scopes that pages name; past a limit, new scopes share the "renderer" logger. */
+    [[nodiscard]] auto resolveRendererLogger(const std::string& scope) -> std::shared_ptr<Logger>;
 
     [[nodiscard]] auto buildPluginInfoArray(v8::Local<v8::Context> context) const -> v8::Local<v8::Value>;
     void               tickCallback();
@@ -187,6 +190,7 @@ struct JsRuntime::State {
 
     std::mutex                                    mLoggerMutex;
     std::unordered_map<std::string, LoggerHandle> mLoggers;
+    std::unordered_set<std::string>               mRendererScopes;
 };
 
 } // namespace CloverNT::Core::Modules

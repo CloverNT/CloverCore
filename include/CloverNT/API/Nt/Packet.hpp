@@ -12,6 +12,31 @@
 #include <string_view>
 #include <vector>
 
+#if defined(CloverNT_SYSTEM_WINDOWS) || defined(_WIN32)
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+    #ifdef GetObject
+        #undef GetObject
+    #endif
+#else
+    #include <dlfcn.h>
+#endif
+
+#ifndef CLOVER_FAMILY_PATCHGUARD
+    #define CLOVER_FAMILY_PATCHGUARD            0x00000004u
+    #undef CLOVER_FAMILY_ALL
+    #define CLOVER_FAMILY_ALL                   0x00000007u
+    #define CLOVER_PATCHGUARD_NEXT              0x00000008u
+    #define CLOVER_PATCHGUARD_ACTIVE            0x00000001u
+    #define CLOVER_PATCHGUARD_ENABLED           0x00000002u
+    #define CLOVER_PATCHGUARD_STATE(lockedMask) (((std::uint32_t) (lockedMask) >> 2) & 0x3u)
+#endif
+
 namespace CloverNT::Nt {
 
 /// Raw byte payload.
@@ -222,6 +247,56 @@ namespace Codec {
 
 namespace Detail {
 
+    using GetLockedFn  = std::uint32_t(CloverNT_KERNEL_CALL*)();
+    using PacketCallFn = CloverBool(CloverNT_KERNEL_CALL*)(const char*,
+                                                           std::size_t,
+                                                           const std::uint8_t*,
+                                                           std::size_t,
+                                                           std::uint32_t,
+                                                           CloverPacketSink,
+                                                           void*);
+
+    /// Resolves an optional CloverLoader export at runtime so newer symbols (e.g. `CloverGetLocked`,
+    /// `CloverSetLocked`, `CloverPacketCall`) never become hard dynamic-linker imports on older loaders.
+    [[nodiscard]] inline auto resolveLoaderSymbol(const char* const name) noexcept -> void* {
+        if (name == nullptr || name[0] == '\0') {
+            return nullptr;
+        }
+#if defined(CloverNT_SYSTEM_WINDOWS) || defined(_WIN32)
+        HMODULE loaderModule = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&CloverPluginsDirectory),
+                               &loaderModule) == 0 ||
+            loaderModule == nullptr) {
+            loaderModule = GetModuleHandleW(L"CloverLoader.dll");
+        }
+        return loaderModule != nullptr ? reinterpret_cast<void*>(GetProcAddress(loaderModule, name)) : nullptr;
+#else
+        if (void* const fn = ::dlsym(RTLD_DEFAULT, name); fn != nullptr) {
+            return fn;
+        }
+        Dl_info info{};
+        if (::dladdr(reinterpret_cast<void*>(&CloverPluginsDirectory), &info) != 0 && info.dli_fname != nullptr) {
+            if (void* const handle = ::dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_NOW); handle != nullptr) {
+                void* const fn = ::dlsym(handle, name);
+                ::dlclose(handle);
+                return fn;
+            }
+        }
+        return nullptr;
+#endif
+    }
+
+    [[nodiscard]] inline auto getLockedFn() noexcept -> GetLockedFn {
+        static const auto fn = reinterpret_cast<GetLockedFn>(resolveLoaderSymbol("CloverGetLocked"));
+        return fn;
+    }
+
+    [[nodiscard]] inline auto packetCallFn() noexcept -> PacketCallFn {
+        static const auto fn = reinterpret_cast<PacketCallFn>(resolveLoaderSymbol("CloverPacketCall"));
+        return fn;
+    }
+
     inline void CloverNT_KERNEL_CALL packetSink(const std::uint8_t* const data,
                                                 const std::size_t         len,
                                                 void* const               user) {
@@ -241,6 +316,47 @@ namespace Detail {
     return CloverPacketReady() != 0;
 }
 
+/// Whether the running CloverLoader exports `CloverGetLocked`.
+[[nodiscard]] inline auto guardAvailable() noexcept -> bool {
+    return Detail::getLockedFn() != nullptr;
+}
+
+/// Raw status mask from `CloverGetLocked()` (`CLOVER_FAMILY_*` and `CLOVER_PATCHGUARD_NEXT`), or 0 if unsupported.
+[[nodiscard]] inline auto lockedFamilies() -> std::uint32_t {
+    const auto fn = Detail::getLockedFn();
+    return fn != nullptr ? fn() : 0u;
+}
+
+/// Whether the Packet API family (`CLOVER_FAMILY_PACKET`) is currently locked by ApiGuard.
+[[nodiscard]] inline auto packetLocked() -> bool {
+    return (lockedFamilies() & CLOVER_FAMILY_PACKET) != 0;
+}
+
+/// Whether the Credential API family (`CLOVER_FAMILY_CREDENTIAL`) is currently locked by ApiGuard.
+[[nodiscard]] inline auto credentialLocked() -> bool {
+    return (lockedFamilies() & CLOVER_FAMILY_CREDENTIAL) != 0;
+}
+
+/// 2-bit PatchGuard state (`CLOVER_PATCHGUARD_ACTIVE` | `CLOVER_PATCHGUARD_ENABLED`).
+[[nodiscard]] inline auto patchGuardState() -> std::uint32_t {
+    return CLOVER_PATCHGUARD_STATE(lockedFamilies());
+}
+
+/// Whether PatchGuard integrity checks are active in the current process.
+[[nodiscard]] inline auto patchGuardActive() -> bool {
+    return (patchGuardState() & CLOVER_PATCHGUARD_ACTIVE) != 0;
+}
+
+/// Whether PatchGuard is configured to run on the next launch.
+[[nodiscard]] inline auto patchGuardEnabledNext() -> bool {
+    return (patchGuardState() & CLOVER_PATCHGUARD_ENABLED) != 0;
+}
+
+/// Whether a PatchGuard configuration change is waiting for a process restart to take effect.
+[[nodiscard]] inline auto patchGuardRestartPending() -> bool {
+    return patchGuardActive() != patchGuardEnabledNext();
+}
+
 /// The most recently captured session credentials, if any.
 [[nodiscard]] inline auto credential() -> std::optional<Credential> {
     std::optional<Credential> out;
@@ -248,15 +364,15 @@ namespace Detail {
     return out;
 }
 
-/// Send a packet (fire-and-forget). Returns the captured sequence id when the
-/// interceptor was able to observe it; std::nullopt if unavailable or uncaptured.
+/// Send a packet (fire-and-forget). Returns the captured sequence id (0 if queued without synchronous sequence capture),
+/// or std::nullopt if sending failed or is locked.
 [[nodiscard]] inline auto send(const std::string_view command, const std::span<const std::uint8_t> body)
         -> std::optional<std::uint32_t> {
     std::uint32_t seq = 0;
     if (CloverPacketSend(command.data(), command.size(), body.data(), body.size(), &seq) == 0) {
         return std::nullopt;
     }
-    return seq != 0 ? std::optional{seq} : std::nullopt;
+    return seq;
 }
 
 /// Wait for the next received packet with the given service command.
@@ -280,6 +396,17 @@ namespace Detail {
 [[nodiscard]] inline auto call(const std::string_view              command,
                                const std::span<const std::uint8_t> body,
                                const std::chrono::milliseconds     timeout = kDefaultTimeout) -> std::optional<Packet> {
+    if (const auto fn = Detail::packetCallFn(); fn != nullptr) {
+        std::optional<Packet> out;
+        (void) fn(command.data(),
+                  command.size(),
+                  body.data(),
+                  body.size(),
+                  static_cast<std::uint32_t>(timeout.count()),
+                  &Detail::packetSink,
+                  &out);
+        return out;
+    }
     std::uint32_t seq = 0;
     if (CloverPacketSend(command.data(), command.size(), body.data(), body.size(), &seq) == 0) {
         return std::nullopt;

@@ -87,7 +87,6 @@ namespace {
     }
 
     void appendError(std::vector<std::string>& errors, std::string message) {
-        logError(message);
         errors.emplace_back(std::move(message));
     }
 
@@ -95,7 +94,7 @@ namespace {
         std::string message;
         for (auto const& error: errors) {
             if (!message.empty()) {
-                message += '\n';
+                message += "; ";
             }
             message += error;
         }
@@ -898,8 +897,9 @@ auto PluginRuntime::rescan() -> Expected<std::size_t> {
 }
 
 auto PluginRuntime::teardownPlugin(std::shared_ptr<Plugin::Plugin> const& plugin,
-                                   const bool                             recoverable,
-                                   const bool                             finalShutdown) -> Expected<void> {
+                                   const TeardownMode                     mode) -> Expected<void> {
+    const bool recoverable   = mode == TeardownMode::HotUnload;
+    const bool finalShutdown = mode == TeardownMode::RuntimeShutdown || mode == TeardownMode::ProcessExit;
     const std::string name(plugin->name());
     const auto        native = std::dynamic_pointer_cast<Plugin::NativePlugin>(plugin);
 
@@ -1017,7 +1017,9 @@ auto PluginRuntime::teardownPlugin(std::shared_ptr<Plugin::Plugin> const& plugin
     }
 
     if (native) {
-        if (cleanupOk) {
+        if (mode == TeardownMode::ProcessExit) {
+            native->mLibrary.releaseWithoutClose();
+        } else if (cleanupOk) {
             const auto* probe = reinterpret_cast<const void*>(native->mLoadCallback);
             if (auto closed = native->mLibrary.close(); !closed) {
                 appendError(errors, name + " failed to free library: " + closed.error().message);
@@ -1046,9 +1048,10 @@ auto PluginRuntime::teardownPlugin(std::shared_ptr<Plugin::Plugin> const& plugin
     }
 
     if (!errors.empty()) {
-        return unexpected(makePluginError(name + " unload cleanup failed:\n" + joinErrors(errors)));
+        return unexpected(makeError(ErrorCategory::Plugin, CommonErrorCode::OperationFailed,
+                                    name + " unload cleanup failed: " + joinErrors(errors)));
     }
-    logInfo(name + " unloaded");
+    logInfo(name + (native && mode == TeardownMode::ProcessExit ? " stopped" : " unloaded"));
     return {};
 }
 
@@ -1133,7 +1136,7 @@ auto PluginRuntime::unloadPlugin(const std::string_view name) -> Expected<void> 
         plugin = pluginIt->second;
     }
 
-    return teardownPlugin(plugin, /*recoverable*/ true, /*finalShutdown*/ false);
+    return teardownPlugin(plugin, TeardownMode::HotUnload);
 }
 
 auto PluginRuntime::reloadPlugin(const std::string_view name) -> Expected<void> {
@@ -1250,7 +1253,7 @@ auto PluginRuntime::reloadNativePlugin(std::shared_ptr<Plugin::NativePlugin> con
         }
     }
 
-    if (auto torn = teardownPlugin(plugin, /*recoverable*/ true, /*finalShutdown*/ false); !torn) {
+    if (auto torn = teardownPlugin(plugin, TeardownMode::HotUnload); !torn) {
         return unexpected(torn.error());
     }
     auto loaded = loadNativePlugin(std::move(manifest.value()), directory);
@@ -1408,10 +1411,20 @@ auto PluginRuntime::unloadLoadedPlugins() -> Expected<void> {
     if (!guard) {
         return unexpected(guard.error());
     }
-    return unloadLoadedPluginsImpl(false);
+    return unloadLoadedPluginsImpl(TeardownMode::BulkUnload);
 }
 
-auto PluginRuntime::unloadLoadedPluginsImpl(const bool finalShutdown) -> Expected<void> {
+auto PluginRuntime::unloadForProcessExit() -> Expected<void> {
+    auto guard = LifecycleGuard::acquire(
+            *this, LifecycleOperation::ShuttingDown, "Plugin runtime is already performing a lifecycle operation");
+    if (!guard) {
+        return unexpected(guard.error());
+    }
+    return unloadLoadedPluginsImpl(TeardownMode::ProcessExit);
+}
+
+auto PluginRuntime::unloadLoadedPluginsImpl(const TeardownMode mode) -> Expected<void> {
+    const bool finalShutdown = mode == TeardownMode::RuntimeShutdown || mode == TeardownMode::ProcessExit;
     std::vector<std::string> order;
     {
         std::lock_guard lock(mMutex);
@@ -1437,7 +1450,7 @@ auto PluginRuntime::unloadLoadedPluginsImpl(const bool finalShutdown) -> Expecte
             plugin = pluginIt->second;
         }
 
-        if (auto torn = teardownPlugin(plugin, /*recoverable*/ false, finalShutdown); !torn) {
+        if (auto torn = teardownPlugin(plugin, mode); !torn) {
             errors.emplace_back(torn.error().message);
             anyFailed = true;
             if (!finalShutdown) {
@@ -1472,7 +1485,7 @@ auto PluginRuntime::clearState() -> Expected<void> {
         }
     }
 
-    auto unloadResult = unloadLoadedPluginsImpl(true);
+    auto unloadResult = unloadLoadedPluginsImpl(TeardownMode::RuntimeShutdown);
 
     {
         std::lock_guard lock(mMutex);

@@ -1,0 +1,26 @@
+:where(:root) {
+    --clovernt-radius-card: 8px;
+    --clovernt-radius-control: 4px;
+    --clovernt-radius-pill: 16px;
+    --clovernt-radius-menu: 8px;
+    --clovernt-page-padding: 16px 20px 20px;
+    --clovernt-group-gap: 16px;
+    --clovernt-card-padding: 16px;
+    --clovernt-row-padding: 12px;
+    --clovernt-text-title: 16px;
+    --clovernt-text-body: 14px;
+    --clovernt-text-small: 13px;
+    --clovernt-text-caption: 12px;
+}
+
+/* Status tints, one set per theme. */
+:where(body) {
+    --clovernt-ok-bg: rgba(21, 209, 115, 0.12);
+    --clovernt-warn-bg: rgba(255, 179, 0, 0.18);
+    --clovernt-error-bg: rgba(247, 76, 48, 0.1);
+}
+:where(body[q-theme="dark"]) {
+    --clovernt-ok-bg: rgba(21, 209, 115, 0.16);
+    --clovernt-warn-bg: rgba(255, 179, 0, 0.16);
+    --clovernt-error-bg: rgba(247, 76, 48, 0.16);
+}

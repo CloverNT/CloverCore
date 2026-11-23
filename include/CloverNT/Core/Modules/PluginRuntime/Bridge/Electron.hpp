@@ -17,6 +17,7 @@ private:
 
     static void onAppQuitEvent(const v8::FunctionCallbackInfo<v8::Value>& args);
     static void rendererEntries(const v8::FunctionCallbackInfo<v8::Value>& args);
+    static void rendererLog(const v8::FunctionCallbackInfo<v8::Value>& args);
     static void sessionCreated(const v8::FunctionCallbackInfo<v8::Value>& args);
     static void whenReady(const v8::FunctionCallbackInfo<v8::Value>& args);
 };

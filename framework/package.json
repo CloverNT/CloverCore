@@ -6,11 +6,18 @@
   "description": "CloverNT JavaScript plugin framework + SDK (loaded by the native runtime).",
   "scripts": {
     "build": "tsup",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:plugins": "node --test tests/plugins.test.cjs",
+    "test:fonts": "node --test tests/fonts.test.cjs",
+    "test:guard": "node --test tests/guard.test.cjs",
+    "test:trust": "node --test tests/trust.test.cjs",
+    "test:styles": "node --test tests/styles.test.cjs",
+    "test:sdk": "node --test tests/packaged-sdk.test.cjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "electron": "^37.10.3",
+    "esbuild": "^0.28.2",
     "tsup": "^9.0.0",
     "typescript": "^7.0.2"
   }

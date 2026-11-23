@@ -126,6 +126,14 @@ public:
     explicit PacketApi(JsRuntime::State* state) noexcept : mState(state) {}
 
     [[nodiscard]] bool ready() const;
+    [[nodiscard]] bool guardAvailable() const;
+    [[nodiscard]] auto lockedFamilies() const -> std::uint32_t;
+    [[nodiscard]] bool packetLocked() const;
+    [[nodiscard]] bool credentialLocked() const;
+    [[nodiscard]] auto patchGuardState() const -> std::uint32_t;
+    [[nodiscard]] bool patchGuardActive() const;
+    [[nodiscard]] bool patchGuardEnabledNext() const;
+    [[nodiscard]] bool patchGuardRestartPending() const;
     [[nodiscard]] auto credential() const -> std::optional<Nt::Credential>;
     [[nodiscard]] auto send(std::string command, std::vector<std::uint8_t> body) const -> std::optional<std::uint32_t>;
     [[nodiscard]] auto call(std::string command, std::vector<std::uint8_t> body, double timeoutMs) const
@@ -229,6 +237,14 @@ struct Alka::Bind<CloverNT::Core::Modules::bridge::PacketApi>
     using P                       = CloverNT::Core::Modules::bridge::PacketApi;
     static constexpr auto doc     = "Low-level QQNT SSO packet / o3 channel access. Byte payloads are Uint8Array.";
     static constexpr auto members = Alka::members(Alka::method<&P::ready>(),
+                                                  Alka::method<&P::guardAvailable>(),
+                                                  Alka::method<&P::lockedFamilies>(),
+                                                  Alka::method<&P::packetLocked>(),
+                                                  Alka::method<&P::credentialLocked>(),
+                                                  Alka::method<&P::patchGuardState>(),
+                                                  Alka::method<&P::patchGuardActive>(),
+                                                  Alka::method<&P::patchGuardEnabledNext>(),
+                                                  Alka::method<&P::patchGuardRestartPending>(),
                                                   Alka::method<&P::credential>(),
                                                   Alka::method<&P::send>(arg("command"), arg("body")),
                                                   Alka::method<&P::call>(arg("command"), arg("body"), arg("timeoutMs")),
@@ -305,7 +321,8 @@ struct Alka::Bind<CloverNT::Nt::Packet> : Class<CloverNT::Nt::Packet, "Packet"> 
                                                   Alka::prop<&T::uin>(readonly),
                                                   Alka::prop<&T::uid>(readonly),
                                                   Alka::prop<&T::encryption>(readonly),
-                                                  Alka::prop<&T::body>(readonly));
+                                                  Alka::prop<&T::body>(readonly),
+                                                  Alka::prop<&T::injected>(readonly));
 };
 
 template <>

@@ -49,9 +49,12 @@ public:
                                 v8::Local<v8::Value>   module,
                                 v8::Local<v8::Context> context,
                                 void*                  priv);
+    static void cancelPendingGuardRequests(JsRuntime::State& state);
 
 private:
     static void runEventLoopOnce(const v8::FunctionCallbackInfo<v8::Value>& args);
+    static void getGuardLocked(const v8::FunctionCallbackInfo<v8::Value>& args);
+    static void setGuardLocked(const v8::FunctionCallbackInfo<v8::Value>& args);
 };
 
 class Deasync {

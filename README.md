@@ -57,6 +57,23 @@ plugins/
 
 对于 Javascript 插件的开发者，我们尚未提供开发说明和模板，在不久的将来我们会提供相关的开发说明和模板，敬请期待。
 
+### 在插件列表展示 logo
+
+在插件根目录的 `clover.json` 中填写可选的顶层字符串 `logo`，路径相对于该目录。例如，将图片放在 `Greeting/assets/icon.png`，使用如下清单。
+
+```json
+{
+  "name": "Greeting",
+  "type": "js",
+  "entry": "main.js",
+  "logo": "assets/icon.png"
+}
+```
+
+支持 PNG（.png）、JPEG（.jpg 或 .jpeg）和 WebP（.webp），每个文件最大 256 KiB（262144 字节）。图片必须是插件目录内的普通文件，扩展名须与文件签名一致。绝对路径、`..` 路径段、网络地址、data URL 和 SVG 都会被忽略；经符号链接或 Windows 目录联接指向插件目录之外的图片也会被忽略。省略字段、缺少图片或图片无效时，插件仍可正常加载，列表使用默认图标。
+
+`logo` 只供设置窗口读取，原生插件沿用现有 `Manifest` ABI。
+
 ## 文档
 
 尚未提供，尽请期待。

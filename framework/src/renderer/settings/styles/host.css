@@ -1,0 +1,78 @@
+.clovernt-nav-divider {
+    height: 1px;
+    margin: 8px 14px;
+    background-color: var(--border_standard, rgba(128, 128, 128, 0.2));
+    pointer-events: none;
+    flex-shrink: 0;
+}
+
+.clovernt-nav-item {
+    display: flex;
+    align-items: center;
+    box-sizing: border-box;
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+    color: var(--text_primary);
+    -webkit-app-region: no-drag;
+}
+.clovernt-nav-item .icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    margin-right: 8px;
+    flex-shrink: 0;
+    color: currentColor;
+}
+.clovernt-nav-item .icon svg {
+    width: 20px;
+    height: 20px;
+    display: block;
+}
+.clovernt-nav-item:not(.nav-item-active):hover {
+    background-color: var(--overlay_hover);
+}
+.clovernt-nav-item:not(.nav-item-active):active {
+    background-color: var(--overlay_pressed);
+}
+.clovernt-nav-item.nav-item-active {
+    background-color: var(--overlay_active);
+}
+.clovernt-nav-item__text {
+    font-size: 10px;
+    line-height: 20px;
+    font-weight: var(--font-bold, 600);
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.clovernt-setting-title .setting-title__clickable {
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    -webkit-app-region: no-drag;
+}
+.clovernt-setting-title .back-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+}
+
+.clovernt-host-wrapper {
+    min-height: 0;
+}
+.clovernt-scroll-view {
+    height: 100%;
+    width: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+.clovernt-scroll-view > .clovernt-panel {
+    color: var(--text_primary);
+    font-size: 14px;
+    line-height: 20px;
+}

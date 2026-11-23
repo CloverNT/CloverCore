@@ -1,0 +1,51 @@
+.clovernt-font-input {
+    width: 280px;
+}
+.clovernt-font-features .clovernt-chip {
+    flex-shrink: 0;
+}
+.clovernt-font-features {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px 0 14px;
+}
+.clovernt-font-features__head .clovernt-row__tip {
+    white-space: normal;
+}
+.clovernt-font-features__group {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+}
+.clovernt-font-features__caption {
+    flex: 0 0 56px;
+    padding-top: 5px;
+    font-size: var(--clovernt-text-caption);
+    line-height: 16px;
+    color: var(--text_secondary);
+}
+.clovernt-font-features__group .clovernt-filters {
+    flex: 1;
+    min-width: 0;
+}
+.clovernt-font-preview {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--border_standard);
+    font-size: var(--clovernt-text-body);
+    line-height: 22px;
+    color: var(--text_primary);
+    overflow-wrap: anywhere;
+    user-select: text;
+}
+.clovernt-font-preview:last-child {
+    border-bottom: none;
+}
+.clovernt-font-preview__bold {
+    margin-top: 2px;
+    font-weight: 700;
+}
+.clovernt-font-preview.is-mono {
+    font-size: var(--clovernt-text-small);
+    line-height: 20px;
+}
