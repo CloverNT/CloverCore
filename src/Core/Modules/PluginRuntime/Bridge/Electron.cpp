@@ -6,12 +6,16 @@
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Lifecycle.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -19,13 +23,11 @@ namespace CloverNT::Core::Modules::bridge {
 
 namespace {
 
-/** The origin of QQ's own pages; framework/src/shared/trust.ts holds the same value. */
 constexpr std::string_view kTrustedOrigin = "app://.";
 
 constexpr std::size_t kMaxLogScopeBytes   = 64;
 constexpr std::size_t kMaxLogMessageBytes = 8 * 1024;
 
-/** Whether an IPC event comes from one of QQ's own pages; a frame that navigated away or closed does not. */
 bool isTrustedSender(const v8::Local<v8::Context> context, const v8::Local<v8::Value> event) {
     if (event.IsEmpty() || !event->IsObject()) {
         return false;
@@ -38,22 +40,23 @@ bool isTrustedSender(const v8::Local<v8::Context> context, const v8::Local<v8::V
     return !origin.IsEmpty() && origin->IsString() && toUtf8(v8::Isolate::GetCurrent(), origin) == kTrustedOrigin;
 }
 
-/** Text from a page for the log: no control characters, which could forge the log framing or lines, and at most `limit` bytes. */
 std::string loggable(std::string text, const std::size_t limit) {
     std::erase_if(text, [](const unsigned char c) { return c < 0x20 || c == 0x7f; });
     if (text.size() <= limit) {
         return text;
     }
     text.resize(limit);
-    // Drop a UTF-8 sequence that the cut left incomplete.
     std::size_t lead = text.size();
     while (lead > 0 && (static_cast<unsigned char>(text[lead - 1]) & 0xC0) == 0x80) {
         --lead;
     }
     if (lead > 0) {
         const auto        byte   = static_cast<unsigned char>(text[lead - 1]);
-        const std::size_t length = byte < 0x80 ? 1 : byte >= 0xF0 ? 4 : byte >= 0xE0 ? 3 : 2;
-        if (text.size() - (lead - 1) < length) {
+        if (const std::size_t length = byte < 0x80    ? 1
+                                       : byte >= 0xF0 ? 4
+                                       : byte >= 0xE0 ? 3
+                                                      : 2;
+            text.size() - (lead - 1) < length) {
             text.resize(lead - 1);
         }
     }
@@ -91,20 +94,35 @@ void ElectronRuntime::installDetection(JsRuntime::State& state) {
         JsRuntime::State::logger().error("module._load unavailable; electron detection not installed");
         return;
     }
-    state.mOriginalModuleLoad.Reset(isolate, loadVal.As<v8::Function>());
+    const auto originalLoad = loadVal.As<v8::Function>();
+    state.mOriginalModuleLoad.Reset(isolate, originalLoad);
 
-    const auto patched = makeFn(context, &ElectronRuntime::onModuleLoad, v8::External::New(isolate, &state));
+    const auto hookData = v8::Array::New(isolate, 3);
+    (void) hookData->Set(context, 0, v8::External::New(isolate, state.selfCell()));
+    (void) hookData->Set(context, 1, originalLoad);
+    (void) hookData->Set(context, 2, module);
+
+    const auto patched = makeFn(context, &ElectronRuntime::onModuleLoad, hookData);
+    state.mPatchedModuleLoad.Reset(isolate, patched);
+    state.mModuleLoadPatched = true;
     (void) module->Set(context, v8Str(isolate, "_load"), patched);
 }
 
 void ElectronRuntime::onModuleLoad(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        auto* self = dataOf<JsRuntime::State>(args);
-        if (self == nullptr || self->mOriginalModuleLoad.IsEmpty() || self->mModuleBuiltin.IsEmpty()) {
-            return;
-        }
         v8::Isolate* isolate = args.GetIsolate();
         const auto   context = isolate->GetCurrentContext();
+        if (!args.Data()->IsArray()) {
+            return;
+        }
+        const auto           hookData = args.Data().As<v8::Array>();
+        v8::Local<v8::Value> cellVal;
+        v8::Local<v8::Value> origVal;
+        v8::Local<v8::Value> modVal;
+        if (!hookData->Get(context, 0).ToLocal(&cellVal) || !hookData->Get(context, 1).ToLocal(&origVal) ||
+            !hookData->Get(context, 2).ToLocal(&modVal) || !origVal->IsFunction() || !modVal->IsObject()) {
+            return;
+        }
 
         std::vector<v8::Local<v8::Value>> argv;
         argv.reserve(static_cast<std::size_t>(args.Length()));
@@ -112,16 +130,21 @@ void ElectronRuntime::onModuleLoad(const v8::FunctionCallbackInfo<v8::Value>& ar
             argv.push_back(args[i]);
         }
 
-        const auto           original      = self->mOriginalModuleLoad.Get(isolate);
-        const auto           moduleBuiltin = self->mModuleBuiltin.Get(isolate);
+        const auto           original      = origVal.As<v8::Function>();
+        const auto           moduleBuiltin = modVal.As<v8::Object>();
         v8::Local<v8::Value> exported;
         if (!original->Call(context, moduleBuiltin, static_cast<int>(argv.size()), argv.empty() ? nullptr : argv.data())
                      .ToLocal(&exported)) {
-            return; // original _load threw: leave the exception pending so it propagates unchanged
+            return;
         }
         args.GetReturnValue().Set(exported);
 
-        if (self->mElectronReady || args.Length() < 1 || !args[0]->IsString() || !exported->IsObject()) {
+        auto* cell = cellVal->IsExternal()
+                             ? static_cast<JsRuntime::State::SelfCell*>(cellVal.As<v8::External>()->Value())
+                             : nullptr;
+        auto* self = cell != nullptr ? cell->state.load(std::memory_order_acquire) : nullptr;
+        if (self == nullptr || self->mElectronReady || args.Length() < 1 || !args[0]->IsString() ||
+            !exported->IsObject()) {
             return;
         }
         if (toUtf8(isolate, args[0]) != "electron") {
@@ -129,15 +152,20 @@ void ElectronRuntime::onModuleLoad(const v8::FunctionCallbackInfo<v8::Value>& ar
         }
         const auto electron = exported.As<v8::Object>();
         if (const auto appVal = getProp(context, electron, "app"); appVal.IsEmpty() || !appVal->IsObject()) {
-            return; // electron not fully initialised yet; wait for a later require('electron')
+            return;
         }
-        (void) moduleBuiltin->Set(context, v8Str(isolate, "_load"), original); // restore the original loader
+        if (const auto curLoad = getProp(context, moduleBuiltin, "_load");
+            !curLoad.IsEmpty() && !self->mPatchedModuleLoad.IsEmpty() &&
+            curLoad->StrictEquals(self->mPatchedModuleLoad.Get(isolate))) {
+            (void) moduleBuiltin->Set(context, v8Str(isolate, "_load"), original);
+        }
+        self->mModuleLoadPatched = false;
+        self->mPatchedModuleLoad.Reset();
         onElectronReady(*self, electron);
     });
 }
 
-void ElectronRuntime::onElectronReady(JsRuntime::State&           state,
-                                                         const v8::Local<v8::Object> electron) {
+void ElectronRuntime::onElectronReady(JsRuntime::State&           state, const v8::Local<v8::Object> electron) {
     v8::Isolate* isolate = state.mIsolate;
     if (isolate == nullptr || state.mElectronReady) {
         return;
@@ -153,27 +181,26 @@ void ElectronRuntime::onElectronReady(JsRuntime::State&           state,
         state.mIpcMain.Reset(isolate, ipcVal.As<v8::Object>());
     }
 
-    const auto ext = v8::External::New(isolate, &state);
+    const auto ext = v8::External::New(isolate, state.selfCell());
 
     if (!state.mIpcMain.IsEmpty()) {
-        const auto ipc = state.mIpcMain.Get(isolate);
-        invokeMethod(context,
-                     ipc,
-                     "on",
-                     {v8Str(isolate, "clovernt:log"), makeFn(context, &ElectronRuntime::rendererLog, ext)});
+        const auto ipc           = state.mIpcMain.Get(isolate);
+        const auto rendererLogFn = makeFn(context, &ElectronRuntime::rendererLog, ext);
+        state.mRendererLogListener.Reset(isolate, rendererLogFn);
+        invokeMethod(context, ipc, "on", {v8Str(isolate, "clovernt:log"), rendererLogFn});
         invokeMethod(
                 context,
                 ipc,
                 "handle",
                 {v8Str(isolate, "clovernt:renderer-entries"), makeFn(context, &ElectronRuntime::rendererEntries, ext)});
+        state.mRendererEntriesHandled = true;
     }
 
     if (!state.mApp.IsEmpty()) {
-        const auto app = state.mApp.Get(isolate);
-        invokeMethod(context,
-                     app,
-                     "on",
-                     {v8Str(isolate, "session-created"), makeFn(context, &ElectronRuntime::sessionCreated, ext)});
+        const auto app              = state.mApp.Get(isolate);
+        const auto sessionCreatedFn = makeFn(context, &ElectronRuntime::sessionCreated, ext);
+        state.mSessionCreatedListener.Reset(isolate, sessionCreatedFn);
+        invokeMethod(context, app, "on", {v8Str(isolate, "session-created"), sessionCreatedFn});
         // app.whenReady().then(whenReady) -> register defaultSession preloads
         if (const auto whenReadyVal = getProp(context, app, "whenReady");
             !whenReadyVal.IsEmpty() && whenReadyVal->IsFunction()) {
@@ -205,11 +232,10 @@ void ElectronRuntime::onElectronReady(JsRuntime::State&           state,
 
 void ElectronRuntime::rendererEntries(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        auto*        state   = dataOf<JsRuntime::State>(args);
+        auto*        state   = stateOf(args);
         v8::Isolate* isolate = args.GetIsolate();
         const auto   context = isolate->GetCurrentContext();
         const auto   array   = v8::Array::New(isolate);
-        // Pages other than QQ's own get no renderer code, only the fonts the preload applies.
         if (state != nullptr && args.Length() > 0 && isTrustedSender(context, args[0])) {
             std::vector<std::pair<std::string, std::filesystem::path>> entries;
             {
@@ -242,10 +268,9 @@ void ElectronRuntime::rendererEntries(const v8::FunctionCallbackInfo<v8::Value>&
 
 void ElectronRuntime::rendererLog(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        auto*        state   = dataOf<JsRuntime::State>(args);
+        auto*        state   = stateOf(args);
         v8::Isolate* isolate = args.GetIsolate();
         const auto   context = isolate->GetCurrentContext();
-        // An ipcMain.on listener gets (event, level, scope, message).
         if (state == nullptr || args.Length() < 4 || !isTrustedSender(context, args[0])) {
             return;
         }
@@ -260,8 +285,7 @@ void ElectronRuntime::rendererLog(const v8::FunctionCallbackInfo<v8::Value>& arg
 
 void ElectronRuntime::sessionCreated(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        if (auto* state = dataOf<JsRuntime::State>(args);
-            state != nullptr && args.Length() >= 1 && args[0]->IsObject()) {
+        if (auto* state = stateOf(args); state != nullptr && args.Length() >= 1 && args[0]->IsObject()) {
             onSessionCreated(*state, args[0].As<v8::Object>());
         }
     });
@@ -269,7 +293,7 @@ void ElectronRuntime::sessionCreated(const v8::FunctionCallbackInfo<v8::Value>& 
 
 void ElectronRuntime::whenReady(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        auto* state = dataOf<JsRuntime::State>(args);
+        auto* state = stateOf(args);
         if (state == nullptr || state->mElectron.IsEmpty()) {
             return;
         }
@@ -286,8 +310,7 @@ void ElectronRuntime::whenReady(const v8::FunctionCallbackInfo<v8::Value>& args)
     });
 }
 
-void ElectronRuntime::onSessionCreated(JsRuntime::State&           state,
-                                                          const v8::Local<v8::Object> session) {
+void ElectronRuntime::onSessionCreated(JsRuntime::State&           state, const v8::Local<v8::Object> session) {
     v8::Isolate* isolate = state.mIsolate;
     if (isolate == nullptr) {
         return;
@@ -320,7 +343,7 @@ void ElectronRuntime::onSessionCreated(JsRuntime::State&           state,
 
 void ElectronRuntime::onAppQuitEvent(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        auto* self = dataOf<JsRuntime::State>(args);
+        auto* self = stateOf(args);
         if (self == nullptr) {
             return;
         }
@@ -367,11 +390,11 @@ void ElectronRuntime::registerShutdownHook(JsRuntime::State& state) {
     }
 
     v8::Local<v8::Function> listener;
-    if (!v8::Function::New(context, &ElectronRuntime::onAppQuitEvent, v8::External::New(isolate, &state))
+    if (!v8::Function::New(context, &ElectronRuntime::onAppQuitEvent, v8::External::New(isolate, state.selfCell()))
                  .ToLocal(&listener)) {
         return;
     }
-    // The earlier before-quit and will-quit events can both be cancelled.
+
     v8::Local<v8::Value> onArgs[] = {v8::String::NewFromUtf8Literal(isolate, "quit"), listener};
     if (onValue.As<v8::Function>()->Call(context, app, 2, onArgs).IsEmpty()) {
         JsRuntime::State::logger().error("shutdown hook registration failed: {}",
@@ -381,6 +404,7 @@ void ElectronRuntime::registerShutdownHook(JsRuntime::State& state) {
 
     {
         std::lock_guard lock(state.mMutex);
+        state.mAppQuitListener.Reset(isolate, listener);
         state.mShutdownHookRegistered = true;
     }
 }

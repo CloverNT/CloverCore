@@ -5,6 +5,9 @@ import {extname, join} from "node:path";
 import type {SystemFontFace, SystemFontFamily} from "../shared/fonts";
 
 const FONT_EXTENSIONS = new Set([".ttf", ".otf", ".ttc", ".otc"]);
+const MAX_TABLE_BYTES = 16 * 1024 * 1024;
+const MAX_TTC_FACES = 256;
+const SCAN_CONCURRENCY = 24;
 
 function fontDirectories(): string[] {
     const home = homedir();
@@ -34,9 +37,23 @@ async function fontFiles(directory: string): Promise<string[]> {
 }
 
 class FontFile {
-    constructor(private readonly handle: FileHandle) {}
+    constructor(private readonly handle: FileHandle, readonly size: number) {
+    }
 
     async read(position: number, length: number): Promise<DataView> {
+        if (
+            !Number.isSafeInteger(position)
+            || !Number.isSafeInteger(length)
+            || position < 0
+            || length < 0
+            || length > MAX_TABLE_BYTES
+            || position + length > this.size
+        ) {
+            throw new Error("font read out of bounds");
+        }
+        if (length === 0) {
+            return new DataView(new ArrayBuffer(0));
+        }
         const buffer = Buffer.alloc(length);
         const {bytesRead} = await this.handle.read(buffer, 0, length, position);
         if (bytesRead < length) {
@@ -66,12 +83,18 @@ async function tableDirectory(file: FontFile, offset: number): Promise<Tables> {
 const NAME = {family: 1, style: 2, fullName: 4, postscript: 6, typographicFamily: 16, typographicStyle: 17} as const;
 
 async function readNames(file: FontFile, table: { offset: number; length: number }): Promise<Map<number, string[]>> {
+    if (table.length < 6) {
+        return new Map();
+    }
     const view = await file.read(table.offset, table.length);
     const count = view.getUint16(2);
     const storage = view.getUint16(4);
     const ranked: Array<{ id: number; rank: number; value: string }> = [];
     for (let i = 0; i < count; i++) {
         const record = 6 + i * 12;
+        if (record + 12 > view.byteLength) {
+            break;
+        }
         const platform = view.getUint16(record);
         const encoding = view.getUint16(record + 2);
         const language = view.getUint16(record + 4);
@@ -107,12 +130,23 @@ async function readFeatures(file: FontFile, tables: Tables): Promise<string[]> {
         if (!table || table.length < 10) {
             continue;
         }
-        const header = await file.read(table.offset, 10);
-        const listOffset = table.offset + header.getUint16(6);
-        const count = (await file.read(listOffset, 2)).getUint16(0);
-        const records = await file.read(listOffset + 2, count * 6);
-        for (let i = 0; i < count; i++) {
-            features.add(tag(records, i * 6));
+        try {
+            const header = await file.read(table.offset, 10);
+            const relOffset = header.getUint16(6);
+            if (relOffset === 0 || relOffset + 2 > table.length) {
+                continue;
+            }
+            const listOffset = table.offset + relOffset;
+            const count = (await file.read(listOffset, 2)).getUint16(0);
+            if (relOffset + 2 + count * 6 > table.length) {
+                continue;
+            }
+            const records = await file.read(listOffset + 2, count * 6);
+            for (let i = 0; i < count; i++) {
+                features.add(tag(records, i * 6));
+            }
+        } catch {
+            // Skip malformed optional layout table instead of failing the face.
         }
     }
     return [...features].sort();
@@ -125,18 +159,31 @@ interface Variation {
     instances: Array<{ style: string; coordinates: Record<string, number>; postscriptName?: string }>;
 }
 
-async function readVariation(file: FontFile, table: { offset: number; length: number }, names: Map<number, string[]>): Promise<Variation> {
+async function readVariation(file: FontFile, table: {
+    offset: number;
+    length: number
+}, names: Map<number, string[]>): Promise<Variation | undefined> {
+    if (table.length < 16) {
+        return undefined;
+    }
     const view = await file.read(table.offset, table.length);
     const axesOffset = view.getUint16(4);
     const axisCount = view.getUint16(8);
     const axisSize = view.getUint16(10);
     const instanceCount = view.getUint16(12);
     const instanceSize = view.getUint16(14);
+    if (axisCount === 0 || axisSize < 20 || axesOffset + axisCount * axisSize > view.byteLength) {
+        return undefined;
+    }
     const axes = Array.from({length: axisCount}, (_, i) => {
         const at = axesOffset + i * axisSize;
         return {tag: tag(view, at), min: fixed(view, at + 4), default: fixed(view, at + 8), max: fixed(view, at + 12)};
     });
     const instancesOffset = axesOffset + axisCount * axisSize;
+    const minInstanceSize = 4 + axisCount * 4;
+    if (instanceCount > 0 && (instanceSize < minInstanceSize || instancesOffset + instanceCount * instanceSize > view.byteLength)) {
+        return {axes, instances: []};
+    }
     const instances = Array.from({length: instanceCount}, (_, i) => {
         const at = instancesOffset + i * instanceSize;
         const coordinates = Object.fromEntries(axes.map((axis, a) => [axis.tag, fixed(view, at + 4 + a * 4)]));
@@ -159,8 +206,9 @@ async function readFace(file: FontFile, offset: number): Promise<SystemFontFace 
     const names = await readNames(file, nameTable);
     const families = [...(names.get(NAME.typographicFamily) ?? []), ...(names.get(NAME.family) ?? [])];
     const os2 = tables.get("OS/2");
-    const os2View = os2 && os2.length >= 64 ? await file.read(os2.offset, 64) : undefined;
-    const variation = tables.get("fvar") ? await readVariation(file, tables.get("fvar")!, names) : undefined;
+    const os2View = os2 && os2.length >= 64 ? await file.read(os2.offset, 64).catch(() => undefined) : undefined;
+    const fvar = tables.get("fvar");
+    const variation = fvar ? await readVariation(file, fvar, names).catch(() => undefined) : undefined;
     const face: SystemFontFace & { families: string[] } = {
         families: [...new Set(families)],
         style: names.get(NAME.typographicStyle)?.[0] ?? names.get(NAME.style)?.[0] ?? "Regular",
@@ -168,7 +216,7 @@ async function readFace(file: FontFile, offset: number): Promise<SystemFontFace 
         postscriptName: names.get(NAME.postscript)?.[0] ?? "",
         weight: os2View?.getUint16(4) ?? 400,
         italic: ((os2View?.getUint16(62) ?? 0) & 0x201) !== 0,
-        features: await readFeatures(file, tables),
+        features: await readFeatures(file, tables).catch(() => []),
     };
     if (variation) {
         face.axes = variation.axes;
@@ -180,24 +228,48 @@ async function readFace(file: FontFile, offset: number): Promise<SystemFontFace 
 async function readFontFile(path: string): Promise<Array<SystemFontFace & { families: string[] }>> {
     const handle = await open(path, "r");
     try {
-        const file = new FontFile(handle);
+        const {size} = await handle.stat();
+        const file = new FontFile(handle, size);
         const header = await file.read(0, 12);
         if (tag(header, 0) !== "ttcf") {
             const face = await readFace(file, 0);
             return face ? [face] : [];
         }
         const count = header.getUint32(8);
+        if (count === 0 || count > MAX_TTC_FACES) {
+            return [];
+        }
         const offsets = await file.read(12, count * 4);
-        const faces = await Promise.all(Array.from({length: count}, (_, i) => readFace(file, offsets.getUint32(i * 4))));
-        return faces.filter((face) => face !== undefined);
+        const faces: Array<SystemFontFace & { families: string[] }> = [];
+        for (let i = 0; i < count; i++) {
+            const face = await readFace(file, offsets.getUint32(i * 4)).catch(() => undefined);
+            if (face) {
+                faces.push(face);
+            }
+        }
+        return faces;
     } finally {
         await handle.close();
     }
 }
 
+async function mapConcurrent<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+    const results = new Array<R>(items.length);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+        while (next < items.length) {
+            const index = next++;
+            results[index] = await fn(items[index]!);
+        }
+    };
+    const workers = Math.min(limit, items.length);
+    await Promise.all(Array.from({length: workers}, worker));
+    return results;
+}
+
 export async function scanFonts(directories: string[]): Promise<SystemFontFamily[]> {
     const paths = (await Promise.all(directories.map(fontFiles))).flat();
-    const faces = (await Promise.all(paths.map((path) => readFontFile(path).catch(() => [])))).flat();
+    const faces = (await mapConcurrent(paths, SCAN_CONCURRENCY, (path) => readFontFile(path).catch(() => []))).flat();
     const families = new Map<string, SystemFontFamily>();
     for (const {families: names, ...face} of faces) {
         const [name] = names;

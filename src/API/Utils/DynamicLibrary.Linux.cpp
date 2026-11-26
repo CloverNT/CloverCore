@@ -1,19 +1,22 @@
 #include <CloverNT/API/Utils/DynamicLibrary.hpp>
 
+#include <filesystem>
+#include <string>
+#include <string_view>
+
 #include <dlfcn.h>
 
 namespace CloverNT::Utils {
 
 auto DynamicLibrary::load(std::filesystem::path const& path, std::filesystem::path const& searchDirectory)
         -> Expected<void> {
-    // dlopen has no per-call search dir; plugin-local deps must use RUNPATH/RPATH ($ORIGIN).
     (void) searchDirectory;
     if (mHandle != nullptr) {
         return unexpected(
                 ErrorCategory::DynamicLibrary, CommonErrorCode::AlreadyLoaded, "dynamic library is already loaded");
     }
 
-    auto handle = ::dlopen(path.c_str(), RTLD_NOW);
+    auto handle = dlopen(path.c_str(), RTLD_NOW);
     if (handle == nullptr) {
         if (auto const* message = ::dlerror(); message != nullptr) {
             return unexpected(ErrorCategory::DynamicLibrary, CommonErrorCode::OperationFailed, message);
@@ -28,7 +31,7 @@ auto DynamicLibrary::close() -> Expected<void> {
     if (mHandle == nullptr) {
         return {};
     }
-    if (::dlclose(mHandle) != 0) {
+    if (dlclose(mHandle) != 0) {
         if (auto const* message = ::dlerror(); message != nullptr) {
             return unexpected(ErrorCategory::DynamicLibrary, CommonErrorCode::OperationFailed, message);
         }

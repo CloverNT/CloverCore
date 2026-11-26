@@ -2,14 +2,10 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <initializer_list>
 #include <memory>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -93,7 +89,7 @@ struct SignatureElement {
     std::byte mask{};
 
     [[nodiscard]] static constexpr auto byte(const std::byte value) noexcept -> SignatureElement {
-        return {value, std::byte{0xFF}};
+        return {.value = value, .mask = std::byte{0xFF}};
     }
 
     [[nodiscard]] static constexpr auto wildcard() noexcept -> SignatureElement {
@@ -318,8 +314,6 @@ public:
         return mAddress;
     }
 
-    /// Reads an integral value at @p offset from the scan hit. Returns an error
-    /// instead of dereferencing a null/unreadable address when the scan missed.
     template <std::integral Int>
     [[nodiscard]] auto read(const std::size_t offset = 0) const -> Expected<Int> {
         if (!hasResult()) {
@@ -332,8 +326,6 @@ public:
         return value;
     }
 
-    /// Resolves a 32-bit relative displacement (e.g. a RIP-relative operand) at
-    /// @p offset into an absolute address, validating the read first.
     [[nodiscard]] auto rel(const std::size_t offset, const std::size_t remaining = 0) const -> Expected<Address> {
         auto displacement = read<std::int32_t>(offset);
         if (!displacement) {
@@ -419,8 +411,6 @@ findAll(std::string_view moduleName, Signature const& signature, ScanOptions opt
                                                  Signature const& signature,
                                                  ScanOptions      options = {}) -> std::vector<ScanResult>;
 
-// Overloads taking a non-owning SignatureView (e.g. a compile-time `_sigv` /
-// `_sig` pattern). These keep the readable pattern text out of the binary.
 [[nodiscard]] CloverNT_API auto
 findFirst(std::string_view moduleName, SignatureView signature, ScanOptions options = {}) -> ScanResult;
 [[nodiscard]] CloverNT_API auto findFirst(Module const& module, SignatureView signature, ScanOptions options = {})

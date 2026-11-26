@@ -1,5 +1,7 @@
 #include <CloverNT/API/Plugin/Plugin.hpp>
 
+#include <atomic>
+#include <string_view>
 #include <utility>
 
 namespace CloverNT::Plugin {

@@ -17,13 +17,15 @@ public:
                                      v8::Local<v8::Context>            context,
                                      JsRuntime::State::JsPluginRecord& record) -> v8::Local<v8::Object>;
 
-    static void runDisposers(v8::Local<v8::Context>            context,
+    static void runDisposers(JsRuntime::State&                 state,
+                             v8::Local<v8::Context>            context,
                              JsRuntime::State::JsPluginRecord& record,
                              std::vector<std::string>&         errors);
 
     static void invalidateBindings(JsRuntime::State& state, const JsRuntime::State::JsPluginRecord* record);
 
-    static void setShuttingDown(bool value);
+    static void               setShuttingDown(bool value);
+    [[nodiscard]] static bool isShuttingDown() noexcept;
 
 private:
     [[nodiscard]] static auto liveBinding(const v8::FunctionCallbackInfo<v8::Value>& args)

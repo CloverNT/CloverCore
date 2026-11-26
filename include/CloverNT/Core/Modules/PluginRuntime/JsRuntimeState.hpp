@@ -1,12 +1,14 @@
 #pragma once
+#include <CloverNT/API/Events/Subscription.hpp>
 #include <CloverNT/API/Logger.hpp>
-#include <CloverNT/API/Plugin/PluginManager.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/JsRuntime.hpp>
+
+#include <Alka/Runtime/Dispatcher.hpp>
 
 #include <atomic>
 #include <cstdint>
-#include <deque>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -27,15 +29,6 @@ namespace CloverNT::Plugin {
 class JsPlugin;
 } // namespace CloverNT::Plugin
 
-namespace CloverNT::Event {
-class NamedEvent;
-} // namespace CloverNT::Event
-
-namespace CloverNT::Core::Modules::bridge {
-struct JsEventChannel;
-struct PendingEvent;
-} // namespace CloverNT::Core::Modules::bridge
-
 namespace CloverNT::Core::Modules {
 
 struct LoggerHandle {
@@ -45,13 +38,22 @@ struct LoggerHandle {
 struct JsRuntime::State {
     enum class LifecycleOp { Load, Unload, Reload };
 
+    struct SelfCell {
+        std::atomic<State*> state{};
+    };
+
     explicit State(Callbacks callbacks);
     ~State();
 
     State(State const&)            = delete;
     State& operator=(State const&) = delete;
 
+    [[nodiscard]] auto selfCell() const noexcept -> SelfCell* {
+        return mSelfCell;
+    }
+
     [[nodiscard]] bool isAttached() const;
+    [[nodiscard]] bool isOnMainThread() const noexcept;
     void               attach(node::Environment*     env,
                               v8::Isolate*           isolate,
                               v8::Local<v8::Context> context,
@@ -66,6 +68,7 @@ struct JsRuntime::State {
     [[nodiscard]] auto reloadPlugin(std::string_view name) -> Expected<void>;
 
     void               detachState();
+    void               abandonHandlesOffThread() noexcept;
     [[nodiscard]] auto callHandler(const v8::Global<v8::Function>& handler, std::string_view name) const
             -> Expected<void>;
     [[nodiscard]] auto dispatchLifecycle(LifecycleOp op, std::string_view name) -> Expected<void>;
@@ -73,25 +76,23 @@ struct JsRuntime::State {
     static void        onLifecycleAsync(uv_async_t* handle);
     void               drainLifecycleQueue(const Expected<void>& reason);
 
-    static void onEventAsync(uv_async_t* handle);
-    void        dispatchEventToJs(const bridge::PendingEvent& pending);
-    void        invokeEventCallback(std::uint64_t subId, v8::Local<v8::Value> payload, Event::NamedEvent* cancellable);
-    void        clearEventSubscriptions();
-    bool        removeEventSubscription(std::uint64_t subId);
-    void        clearEventSubscriptionsForOwner(std::string_view ownerName);
+    static void onAlkaAsync(uv_async_t* handle);
+    void        syncAlkaLoopRef() noexcept;
+    void        trackJsSubscription(CloverNT::Event::SubscriptionId id);
+    void        untrackJsSubscription(CloverNT::Event::SubscriptionId id) noexcept;
+    void        clearAllJsSubscriptions() noexcept;
 
     void               registerLoaderCallbacks(std::string id, v8::Local<v8::Object> config);
     void               unregisterLoaderCallbacks(std::string_view id);
     [[nodiscard]] auto loaderLifecycle(std::string_view id, LifecycleOp op, std::string_view name) const
             -> Expected<void>;
 
-    void               runEventLoopOnce() const;
+    [[nodiscard]] int  runEventLoopOnce() const;
     [[nodiscard]] auto requireModule(v8::Local<v8::Context> context, const std::string& path) const
             -> v8::MaybeLocal<v8::Value>;
     static auto        logger() -> Logger&;
     [[nodiscard]] auto loggerHandle(const std::string& scope) -> LoggerHandle&;
     [[nodiscard]] auto resolveLogger(const std::string& scope) -> std::shared_ptr<Logger>;
-    /** Like resolveLogger for scopes that pages name; past a limit, new scopes share the "renderer" logger. */
     [[nodiscard]] auto resolveRendererLogger(const std::string& scope) -> std::shared_ptr<Logger>;
 
     [[nodiscard]] auto buildPluginInfoArray(v8::Local<v8::Context> context) const -> v8::Local<v8::Value>;
@@ -104,6 +105,7 @@ struct JsRuntime::State {
          unregisterPreloadOn(v8::Local<v8::Context> context, v8::Local<v8::Object> session, const std::string& id);
     void reloadAllWindows() const;
 
+    SelfCell*                                      mSelfCell{};
     Callbacks                                      mCallbacks;
     mutable std::recursive_mutex                   mMutex;
     node::Environment*                             mEnv{};
@@ -123,17 +125,38 @@ struct JsRuntime::State {
     v8::Global<v8::Object>              mModuleBuiltin; // require('module')
     v8::Global<v8::Object>              mModuleCache;   // Module._cache
     v8::Global<v8::Function>            mOriginalModuleLoad;
+    v8::Global<v8::Function>            mPatchedModuleLoad;
+    bool                                mModuleLoadPatched{};
+    v8::Global<v8::Function>            mRendererLogListener;
+    v8::Global<v8::Function>            mSessionCreatedListener;
+    v8::Global<v8::Function>            mAppQuitListener;
+    bool                                mRendererEntriesHandled{};
     v8::Global<v8::Function>            mProcessTickCallback;
     bool                                mElectronReady{};
     std::vector<v8::Global<v8::Object>> mSessions;
 
+    struct WebRequestHeadersEntry {
+        std::uint64_t            id{};
+        v8::Global<v8::Function> listener;
+    };
+    struct WebRequestHeadersMux {
+        SelfCell*                           stateCell{};
+        v8::Global<v8::Object>              webRequest;
+        std::vector<WebRequestHeadersEntry> entries;
+    };
+    std::uint64_t                                      mNextHeadersHandlerId{1};
+    std::vector<std::unique_ptr<WebRequestHeadersMux>> mHeadersMuxes;
+    std::uint64_t                                      mNextTimerToken{1};
+
     struct Disposer {
-        enum class Kind { RemoveListener, RemoveHandler, HeadersReceivedNull, ClearTimer, CallFn };
+        enum class Kind { RemoveListener, RemoveHandler, RemoveHeadersReceived, ClearTimer, CallFn };
         Kind                     kind{};
         v8::Global<v8::Object>   target;   // app / ipcMain / session.webRequest
         std::string              key;      // event name or channel
         v8::Global<v8::Function> listener; // RemoveListener
         v8::Global<v8::Value>    timerId;  // ClearTimer
+        std::uint64_t            timerToken{};
+        std::uint64_t            headersHandlerId{};
         bool                     interval{};
         v8::Global<v8::Function> fn; // CallFn (onUnload / returned dispose)
     };
@@ -151,18 +174,19 @@ struct JsRuntime::State {
     std::map<std::string, std::unique_ptr<JsPluginRecord>, std::less<>> mRecords;
 
     struct PluginBinding {
-        State*            state{};
-        JsPluginRecord*   record{};
-        std::atomic<bool> alive{true};
+        std::atomic<State*>          state{};
+        std::atomic<JsPluginRecord*> record{};
+        std::atomic<bool>            alive{true};
     };
-    std::deque<std::unique_ptr<PluginBinding>> mBindings;
+    [[nodiscard]] auto          allocatePluginBinding(JsPluginRecord* record) -> PluginBinding*;
+    std::vector<PluginBinding*> mBindings;
 
     struct LoaderCallbacks {
         v8::Global<v8::Function> load;
         v8::Global<v8::Function> unload;
         v8::Global<v8::Function> reload;
     };
-    std::map<std::string, LoaderCallbacks, std::less<>> mLoaders;
+    std::map<std::string, std::shared_ptr<LoaderCallbacks>, std::less<>> mLoaders;
 
     uv_thread_t mMainThread{};
     uv_async_t* mLifecycleAsync{};
@@ -176,17 +200,12 @@ struct JsRuntime::State {
     std::mutex             mLifecycleQueueMutex;
     std::vector<PendingOp> mLifecycleQueue;
 
-    uv_async_t*                             mEventAsync{};
-    bool                                    mEventAsyncInited{};
-    std::shared_ptr<bridge::JsEventChannel> mEventChannel;
-
-    struct JsSubscription {
-        v8::Global<v8::Function> jsFn;
-        std::string              jsName;
-        bool                     once{};
-        std::string              ownerName;
-    };
-    std::map<std::uint64_t, JsSubscription> mEventSubs; // keyed by the listener's Event::ListenerId
+    uv_async_t*                                         mAlkaAsync{};
+    bool                                                mAlkaAsyncInited{};
+    Alka::Dispatcher                                    mAlkaDispatcher;
+    bool                                                mAlkaReferenced{};
+    std::mutex                                          mJsSubMutex;
+    std::unordered_set<CloverNT::Event::SubscriptionId> mJsEventSubIds;
 
     std::mutex                                    mLoggerMutex;
     std::unordered_map<std::string, LoggerHandle> mLoggers;

@@ -6,7 +6,7 @@ export type ToastKind = "success" | "error" | "info";
 const ICON_BY_KIND: Record<ToastKind, string> = {
     success: ICONS.checkCircle,
     error: ICONS.alertCircle,
-    info: ICONS.checkCircle,
+    info: ICONS.info,
 };
 
 let layer: HTMLElement | undefined;
@@ -25,6 +25,11 @@ export function showToast(message: string, kind: ToastKind = "info", durationMs 
     requestAnimationFrame(() => toast.classList.add("is-visible"));
     setTimeout(() => {
         toast.classList.remove("is-visible");
-        toast.addEventListener("transitionend", () => toast.remove(), {once: true});
+        const cleanup = (): void => {
+            clearTimeout(fallbackTimer);
+            toast.remove();
+        };
+        const fallbackTimer = setTimeout(cleanup, 400);
+        toast.addEventListener("transitionend", cleanup, {once: true});
     }, durationMs);
 }

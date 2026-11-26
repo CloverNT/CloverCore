@@ -1,9 +1,12 @@
+#include <CloverNT/API/Events/EventBus.hpp>
 #include <CloverNT/API/Plugin/JsPlugin.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/AlkaBindings.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Binding.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Lifecycle.hpp>
 #include <CloverNT/Runtime/Kernel.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -68,21 +71,217 @@ void CloverContext::setShuttingDown(const bool value) {
     gShuttingDown = value;
 }
 
+bool CloverContext::isShuttingDown() noexcept {
+    return gShuttingDown;
+}
+
+namespace {
+
+    struct HeadersChainState {
+        v8::Global<v8::Object>                details;
+        v8::Global<v8::Function>              finalCallback;
+        v8::Global<v8::Object>                mergedResponse;
+        std::vector<v8::Global<v8::Function>> listeners;
+        std::size_t                           index{0};
+    };
+
+    void advanceHeadersChain(v8::Isolate*                              isolate,
+                             v8::Local<v8::Context>                    context,
+                             const std::shared_ptr<HeadersChainState>& chain);
+
+    struct HeadersStepData {
+        std::shared_ptr<HeadersChainState> chain;
+        bool                               settled{false};
+    };
+
+    void onHeadersStepCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+        guardedCallback(args, [&] {
+            auto* step = dataOf<HeadersStepData>(args);
+            if (step == nullptr) {
+                return;
+            }
+            if (step->settled) {
+                return;
+            }
+            step->settled    = true;
+            const auto chain = std::move(step->chain);
+            delete step;
+            if (!chain) {
+                return;
+            }
+
+            v8::Isolate* isolate = args.GetIsolate();
+            const auto   context = isolate->GetCurrentContext();
+
+            if (args.Length() > 0 && args[0]->IsObject()) {
+                const auto resp    = args[0].As<v8::Object>();
+                const auto merged  = chain->mergedResponse.Get(isolate);
+                const auto details = chain->details.Get(isolate);
+
+                if (const auto cancelVal = getProp(context, resp, "cancel");
+                    !cancelVal.IsEmpty() && cancelVal->BooleanValue(isolate)) {
+                    setProp(context, merged, "cancel", v8::Boolean::New(isolate, true));
+                    if (!chain->finalCallback.IsEmpty()) {
+                        v8::Local<v8::Value> cbArgs[] = {merged};
+                        (void) chain->finalCallback.Get(isolate)->Call(context, v8::Undefined(isolate), 1, cbArgs);
+                    }
+                    return;
+                }
+                if (const auto headersVal = getProp(context, resp, "responseHeaders");
+                    !headersVal.IsEmpty() && headersVal->IsObject()) {
+                    setProp(context, merged, "responseHeaders", headersVal);
+                    setProp(context, details, "responseHeaders", headersVal);
+                }
+                if (const auto statusVal = getProp(context, resp, "statusLine");
+                    !statusVal.IsEmpty() && statusVal->IsString()) {
+                    setProp(context, merged, "statusLine", statusVal);
+                }
+            }
+
+            advanceHeadersChain(isolate, context, chain);
+        });
+    }
+
+    void advanceHeadersChain(v8::Isolate*                              isolate,
+                             const v8::Local<v8::Context>              context,
+                             const std::shared_ptr<HeadersChainState>& chain) {
+        if (chain->index >= chain->listeners.size()) {
+            if (!chain->finalCallback.IsEmpty()) {
+                v8::Local<v8::Value> cbArgs[] = {chain->mergedResponse.Get(isolate)};
+                (void) chain->finalCallback.Get(isolate)->Call(context, v8::Undefined(isolate), 1, cbArgs);
+            }
+            return;
+        }
+
+        const auto listener = chain->listeners[chain->index++].Get(isolate);
+        auto*      step     = new HeadersStepData{.chain = chain, .settled = false};
+        const auto stepFn   = makeFn(context, &onHeadersStepCallback, v8::External::New(isolate, step));
+
+        v8::Local<v8::Value> callArgs[] = {chain->details.Get(isolate), stepFn};
+        const v8::TryCatch   tryCatch(isolate);
+        if (listener->Call(context, v8::Undefined(isolate), 2, callArgs).IsEmpty()) {
+            JsRuntime::State::logger().error("onHeadersReceived listener threw: {}",
+                                             describeException(isolate, context, tryCatch));
+            if (!step->settled) {
+                step->settled = true;
+                step->chain.reset();
+                delete step;
+                advanceHeadersChain(isolate, context, chain);
+            }
+        }
+    }
+
+    void onHeadersReceivedMuxDispatch(const v8::FunctionCallbackInfo<v8::Value>& args) {
+        guardedCallback(args, [&] {
+            v8::Isolate* isolate = args.GetIsolate();
+            const auto   context = isolate->GetCurrentContext();
+            if (!args.Data()->IsArray() || args.Length() < 2 || !args[0]->IsObject() || !args[1]->IsFunction()) {
+                return;
+            }
+            const auto           muxData = args.Data().As<v8::Array>();
+            v8::Local<v8::Value> cellVal;
+            v8::Local<v8::Value> webReqVal;
+            if (!muxData->Get(context, 0).ToLocal(&cellVal) || !muxData->Get(context, 1).ToLocal(&webReqVal) ||
+                !cellVal->IsExternal() || !webReqVal->IsObject()) {
+                return;
+            }
+            auto*      cell    = static_cast<JsRuntime::State::SelfCell*>(cellVal.As<v8::External>()->Value());
+            auto*      state   = cell != nullptr ? cell->state.load(std::memory_order_acquire) : nullptr;
+            const auto finalCb = args[1].As<v8::Function>();
+
+            if (state == nullptr) {
+                const auto fallback = v8::Object::New(isolate);
+                setProp(context, fallback, "cancel", v8::Boolean::New(isolate, false));
+                v8::Local<v8::Value> cbArgs[] = {fallback};
+                (void) finalCb->Call(context, v8::Undefined(isolate), 1, cbArgs);
+                return;
+            }
+
+            const auto webRequest = webReqVal.As<v8::Object>();
+            const auto chain      = std::make_shared<HeadersChainState>();
+            chain->details.Reset(isolate, args[0].As<v8::Object>());
+            chain->finalCallback.Reset(isolate, finalCb);
+
+            const auto merged = v8::Object::New(isolate);
+            setProp(context, merged, "cancel", v8::Boolean::New(isolate, false));
+            chain->mergedResponse.Reset(isolate, merged);
+
+            for (const auto& mux: state->mHeadersMuxes) {
+                if (mux && !mux->webRequest.IsEmpty() && mux->webRequest.Get(isolate)->StrictEquals(webRequest)) {
+                    chain->listeners.reserve(mux->entries.size());
+                    for (const auto& entry: mux->entries) {
+                        if (!entry.listener.IsEmpty()) {
+                            chain->listeners.emplace_back(isolate, entry.listener.Get(isolate));
+                        }
+                    }
+                    break;
+                }
+            }
+
+            advanceHeadersChain(isolate, context, chain);
+        });
+    }
+
+    void onTimeoutFired(const v8::FunctionCallbackInfo<v8::Value>& args) {
+        guardedCallback(args, [&] {
+            v8::Isolate* isolate = args.GetIsolate();
+            const auto   context = isolate->GetCurrentContext();
+            if (!args.Data()->IsArray()) {
+                return;
+            }
+            const auto           wrapData = args.Data().As<v8::Array>();
+            v8::Local<v8::Value> bindVal;
+            v8::Local<v8::Value> tokenVal;
+            v8::Local<v8::Value> fnVal;
+            if (!wrapData->Get(context, 0).ToLocal(&bindVal) || !wrapData->Get(context, 1).ToLocal(&tokenVal) ||
+                !wrapData->Get(context, 2).ToLocal(&fnVal) || !fnVal->IsFunction()) {
+                return;
+            }
+            if (bindVal->IsExternal() && tokenVal->IsBigInt()) {
+                auto*               binding = static_cast<PluginBinding*>(bindVal.As<v8::External>()->Value());
+                bool                lossless{};
+                const std::uint64_t token = tokenVal.As<v8::BigInt>()->Uint64Value(&lossless);
+                if (binding != nullptr && binding->alive.load(std::memory_order_acquire)) {
+                    if (auto* rec = binding->record.load(std::memory_order_acquire); rec != nullptr) {
+                        std::erase_if(rec->disposers, [token](const Disposer& d) {
+                            return d.kind == Disposer::Kind::ClearTimer && !d.interval && d.timerToken == token;
+                        });
+                    }
+                }
+            }
+
+            std::vector<v8::Local<v8::Value>> callArgs;
+            callArgs.reserve(static_cast<std::size_t>(args.Length()));
+            for (int i = 0; i < args.Length(); ++i) {
+                callArgs.push_back(args[i]);
+            }
+            (void) fnVal.As<v8::Function>()->Call(context,
+                                                  args.This(),
+                                                  static_cast<int>(callArgs.size()),
+                                                  callArgs.empty() ? nullptr : callArgs.data());
+        });
+    }
+
+} // namespace
+
 void CloverContext::invalidateBindings(JsRuntime::State& state, const JsPluginRecord* record) {
-    for (const auto& binding: state.mBindings) {
-        if (binding && binding->record == record) {
-            binding->alive.store(false);
-            binding->record = nullptr;
+    for (auto* binding: state.mBindings) {
+        if (binding != nullptr && binding->record.load(std::memory_order_acquire) == record) {
+            binding->alive.store(false, std::memory_order_release);
+            binding->record.store(nullptr, std::memory_order_release);
+            binding->state.store(nullptr, std::memory_order_release);
         }
     }
     if (record != nullptr) {
-        state.clearEventSubscriptionsForOwner(record->name);
+        (void) Event::EventBus::clearPlugin(record->name);
     }
 }
 
 auto CloverContext::liveBinding(const v8::FunctionCallbackInfo<v8::Value>& args) -> JsRuntime::State::PluginBinding* {
     auto* binding = dataOf<PluginBinding>(args);
-    if (binding == nullptr || !binding->alive.load() || binding->record == nullptr || binding->state == nullptr) {
+    if (binding == nullptr || !binding->alive.load(std::memory_order_acquire) ||
+        binding->record.load(std::memory_order_acquire) == nullptr ||
+        binding->state.load(std::memory_order_acquire) == nullptr) {
         return nullptr;
     }
     return binding;
@@ -93,23 +292,31 @@ void CloverContext::pushListenerDisposer(const PluginBinding*          binding,
                                          const v8::Local<v8::Object>   target,
                                          const std::string&            key,
                                          const v8::Local<v8::Function> listener) {
+    auto* rec = binding->record.load(std::memory_order_acquire);
+    if (rec == nullptr) {
+        return;
+    }
     Disposer disposer;
     disposer.kind = Disposer::Kind::RemoveListener;
     disposer.target.Reset(isolate, target);
     disposer.key = key;
     disposer.listener.Reset(isolate, listener);
-    binding->record->disposers.push_back(std::move(disposer));
+    rec->disposers.push_back(std::move(disposer));
 }
 
 void CloverContext::appOn(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
         const auto* binding = liveBinding(args);
-        if (binding == nullptr || args.Length() < 2 || !args[1]->IsFunction() || binding->state->mApp.IsEmpty()) {
+        if (binding == nullptr) {
+            return;
+        }
+        const auto* state = binding->state.load(std::memory_order_acquire);
+        if (state == nullptr || args.Length() < 2 || !args[1]->IsFunction() || state->mApp.IsEmpty()) {
             return;
         }
         v8::Isolate* isolate = args.GetIsolate();
         const auto   context = isolate->GetCurrentContext();
-        const auto   app     = binding->state->mApp.Get(isolate);
+        const auto   app     = state->mApp.Get(isolate);
         invokeMethod(context, app, "on", {args[0], args[1]});
         pushListenerDisposer(binding, isolate, app, toUtf8(isolate, args[0]), args[1].As<v8::Function>());
     });
@@ -118,12 +325,16 @@ void CloverContext::appOn(const v8::FunctionCallbackInfo<v8::Value>& args) {
 void CloverContext::ipcOn(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
         const auto* binding = liveBinding(args);
-        if (binding == nullptr || args.Length() < 2 || !args[1]->IsFunction() || binding->state->mIpcMain.IsEmpty()) {
+        if (binding == nullptr) {
+            return;
+        }
+        const auto* state = binding->state.load(std::memory_order_acquire);
+        if (state == nullptr || args.Length() < 2 || !args[1]->IsFunction() || state->mIpcMain.IsEmpty()) {
             return;
         }
         v8::Isolate* isolate = args.GetIsolate();
         const auto   context = isolate->GetCurrentContext();
-        const auto   ipc     = binding->state->mIpcMain.Get(isolate);
+        const auto   ipc     = state->mIpcMain.Get(isolate);
         invokeMethod(context, ipc, "on", {args[0], args[1]});
         pushListenerDisposer(binding, isolate, ipc, toUtf8(isolate, args[0]), args[1].As<v8::Function>());
     });
@@ -132,18 +343,24 @@ void CloverContext::ipcOn(const v8::FunctionCallbackInfo<v8::Value>& args) {
 void CloverContext::ipcHandle(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
         const auto* binding = liveBinding(args);
-        if (binding == nullptr || args.Length() < 2 || !args[1]->IsFunction() || binding->state->mIpcMain.IsEmpty()) {
+        if (binding == nullptr) {
+            return;
+        }
+        const auto* state = binding->state.load(std::memory_order_acquire);
+        auto*       rec   = binding->record.load(std::memory_order_acquire);
+        if (state == nullptr || rec == nullptr || args.Length() < 2 || !args[1]->IsFunction() ||
+            state->mIpcMain.IsEmpty()) {
             return;
         }
         v8::Isolate* isolate = args.GetIsolate();
         const auto   context = isolate->GetCurrentContext();
-        const auto   ipc     = binding->state->mIpcMain.Get(isolate);
+        const auto   ipc     = state->mIpcMain.Get(isolate);
         invokeMethod(context, ipc, "handle", {args[0], args[1]});
         Disposer disposer;
         disposer.kind = Disposer::Kind::RemoveHandler;
         disposer.target.Reset(isolate, ipc);
         disposer.key = toUtf8(isolate, args[0]);
-        binding->record->disposers.push_back(std::move(disposer));
+        rec->disposers.push_back(std::move(disposer));
     });
 }
 
@@ -151,6 +368,11 @@ void CloverContext::onHeadersReceived(const v8::FunctionCallbackInfo<v8::Value>&
     guardedCallback(args, [&] {
         const auto* binding = liveBinding(args);
         if (binding == nullptr || args.Length() < 2 || !args[0]->IsObject() || !args[1]->IsFunction()) {
+            return;
+        }
+        auto* state = binding->state.load(std::memory_order_acquire);
+        auto* rec   = binding->record.load(std::memory_order_acquire);
+        if (state == nullptr || rec == nullptr) {
             return;
         }
         v8::Isolate*               isolate   = args.GetIsolate();
@@ -161,18 +383,51 @@ void CloverContext::onHeadersReceived(const v8::FunctionCallbackInfo<v8::Value>&
             return;
         }
         const auto webRequest = webReqVal.As<v8::Object>();
-        invokeMethod(context, webRequest, "onHeadersReceived", {args[1]});
+
+        JsRuntime::State::WebRequestHeadersMux* targetMux = nullptr;
+        for (const auto& existing: state->mHeadersMuxes) {
+            if (existing && !existing->webRequest.IsEmpty() &&
+                existing->webRequest.Get(isolate)->StrictEquals(webRequest)) {
+                targetMux = existing.get();
+                break;
+            }
+        }
+        if (targetMux == nullptr) {
+            auto mux       = std::make_unique<JsRuntime::State::WebRequestHeadersMux>();
+            mux->stateCell = state->selfCell();
+            mux->webRequest.Reset(isolate, webRequest);
+            targetMux = mux.get();
+            state->mHeadersMuxes.push_back(std::move(mux));
+
+            const auto muxData = v8::Array::New(isolate, 2);
+            (void) muxData->Set(context, 0, v8::External::New(isolate, state->selfCell()));
+            (void) muxData->Set(context, 1, webRequest);
+            const auto muxFn = makeFn(context, &onHeadersReceivedMuxDispatch, muxData);
+            invokeMethod(context, webRequest, "onHeadersReceived", {muxFn});
+        }
+
+        const std::uint64_t handlerId = state->mNextHeadersHandlerId++;
+        auto& [id, listener]          = targetMux->entries.emplace_back();
+        id                            = handlerId;
+        listener.Reset(isolate, args[1].As<v8::Function>());
+
         Disposer disposer;
-        disposer.kind = Disposer::Kind::HeadersReceivedNull;
+        disposer.kind             = Disposer::Kind::RemoveHeadersReceived;
+        disposer.headersHandlerId = handlerId;
         disposer.target.Reset(isolate, webRequest);
-        binding->record->disposers.push_back(std::move(disposer));
+        rec->disposers.push_back(std::move(disposer));
     });
 }
 
 void CloverContext::setTimer(const v8::FunctionCallbackInfo<v8::Value>& args, const bool interval) {
     guardedCallback(args, [&] {
-        const auto* binding = liveBinding(args);
+        auto* binding = liveBinding(args);
         if (binding == nullptr) {
+            return;
+        }
+        auto* state = binding->state.load(std::memory_order_acquire);
+        auto* rec   = binding->record.load(std::memory_order_acquire);
+        if (state == nullptr || rec == nullptr) {
             return;
         }
         v8::Isolate*               isolate = args.GetIsolate();
@@ -181,10 +436,19 @@ void CloverContext::setTimer(const v8::FunctionCallbackInfo<v8::Value>& args, co
         if (fnVal.IsEmpty() || !fnVal->IsFunction()) {
             return;
         }
+        const std::uint64_t               token = state->mNextTimerToken++;
         std::vector<v8::Local<v8::Value>> argv;
         argv.reserve(static_cast<std::size_t>(args.Length()));
         for (int i = 0; i < args.Length(); ++i) {
-            argv.push_back(args[i]);
+            if (i == 0 && !interval && args[0]->IsFunction()) {
+                const auto wrapData = v8::Array::New(isolate, 3);
+                (void) wrapData->Set(context, 0, v8::External::New(isolate, binding));
+                (void) wrapData->Set(context, 1, v8::BigInt::NewFromUnsigned(isolate, token));
+                (void) wrapData->Set(context, 2, args[0]);
+                argv.emplace_back(makeFn(context, &onTimeoutFired, wrapData));
+            } else {
+                argv.push_back(args[i]);
+            }
         }
         v8::Local<v8::Value> idValue;
         if (!fnVal.As<v8::Function>()
@@ -196,16 +460,19 @@ void CloverContext::setTimer(const v8::FunctionCallbackInfo<v8::Value>& args, co
             return;
         }
         Disposer disposer;
-        disposer.kind     = Disposer::Kind::ClearTimer;
-        disposer.interval = interval;
+        disposer.kind       = Disposer::Kind::ClearTimer;
+        disposer.interval   = interval;
+        disposer.timerToken = token;
         disposer.timerId.Reset(isolate, idValue);
-        binding->record->disposers.push_back(std::move(disposer));
+        rec->disposers.push_back(std::move(disposer));
         args.GetReturnValue().Set(idValue);
     });
 }
+
 void CloverContext::setTimeout(const v8::FunctionCallbackInfo<v8::Value>& args) {
     setTimer(args, false);
 }
+
 void CloverContext::setInterval(const v8::FunctionCallbackInfo<v8::Value>& args) {
     setTimer(args, true);
 }
@@ -216,10 +483,14 @@ void CloverContext::onUnload(const v8::FunctionCallbackInfo<v8::Value>& args) {
         if (binding == nullptr || args.Length() < 1 || !args[0]->IsFunction()) {
             return;
         }
+        auto* rec = binding->record.load(std::memory_order_acquire);
+        if (rec == nullptr) {
+            return;
+        }
         Disposer disposer;
         disposer.kind = Disposer::Kind::CallFn;
         disposer.fn.Reset(args.GetIsolate(), args[0].As<v8::Function>());
-        binding->record->disposers.push_back(std::move(disposer));
+        rec->disposers.push_back(std::move(disposer));
     });
 }
 
@@ -230,24 +501,19 @@ auto CloverContext::create(JsRuntime::State& state, const v8::Local<v8::Context>
 
     setProp(context, ctxObj, "name", v8Str(isolate, record.name));
     setProp(context, ctxObj, "version", v8Str(isolate, CLOVERNT_VERSION_FULL));
-    setProp(context, ctxObj, "loaderVersion", v8Str(isolate, std::string{CloverNT::Runtime::Kernel::selfVersion()}));
-    setProp(context, ctxObj, "qqVersion", v8Str(isolate, std::string{CloverNT::Runtime::Kernel::qqVersion()}));
+    setProp(context, ctxObj, "loaderVersion", v8Str(isolate, std::string{Runtime::Kernel::selfVersion()}));
+    setProp(context, ctxObj, "qqVersion", v8Str(isolate, std::string{Runtime::Kernel::qqVersion()}));
     setProp(context, ctxObj, "coreDir", v8Str(isolate, state.mCoreDir.string()));
-    setProp(context, ctxObj, "pluginsDir", v8Str(isolate, std::string{CloverNT::Runtime::Kernel::pluginsDir()}));
+    setProp(context, ctxObj, "pluginsDir", v8Str(isolate, std::string{Runtime::Kernel::pluginsDir()}));
     (void) ctxObj->SetNativeDataProperty(
-            context, v8Str(isolate, "plugins"), &pluginsGetter, nullptr, v8::External::New(isolate, &state));
+            context, v8Str(isolate, "plugins"), &pluginsGetter, nullptr, v8::External::New(isolate, state.selfCell()));
     setProp(context, ctxObj, "logger", Logger::create(state, context, record.name));
     if (!state.mElectron.IsEmpty()) {
         setProp(context, ctxObj, "electron", state.mElectron.Get(isolate));
     }
 
-    auto binding    = std::make_unique<PluginBinding>();
-    binding->state  = &state;
-    binding->record = &record;
-    binding->alive.store(true);
-    auto* bindingPtr = binding.get();
-    state.mBindings.push_back(std::move(binding));
-    const auto bext = v8::External::New(isolate, bindingPtr);
+    auto*      bindingPtr = state.allocatePluginBinding(&record);
+    const auto bext       = v8::External::New(isolate, bindingPtr);
 
     const auto app = v8::Object::New(isolate);
     setProp(context, app, "on", makeFn(context, &CloverContext::appOn, bext));
@@ -267,11 +533,15 @@ auto CloverContext::create(JsRuntime::State& state, const v8::Local<v8::Context>
     return ctxObj;
 }
 
-void CloverContext::runDisposers(const v8::Local<v8::Context> context,
+void CloverContext::runDisposers(JsRuntime::State&            state,
+                                 const v8::Local<v8::Context> context,
                                  JsPluginRecord&              record,
                                  std::vector<std::string>&    errors) {
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    for (auto& [kind, target, key, listener, timerId, interval, fn]: std::views::reverse(record.disposers)) {
+    for (auto disposers = std::exchange(record.disposers, {});
+         auto& [kind, target, key, listener, timerId, timerToken, headersHandlerId, interval, fn]:
+         std::views::reverse(disposers)) {
+        (void) timerToken;
         if (gShuttingDown && kind != Disposer::Kind::CallFn) {
             continue;
         }
@@ -288,9 +558,21 @@ void CloverContext::runDisposers(const v8::Local<v8::Context> context,
                 invokeMethod(context, target.Get(isolate), "removeHandler", {v8Str(isolate, key)});
             }
             break;
-        case Disposer::Kind::HeadersReceivedNull:
+        case Disposer::Kind::RemoveHeadersReceived:
             if (!target.IsEmpty()) {
-                invokeMethod(context, target.Get(isolate), "onHeadersReceived", {v8::Null(isolate)});
+                const auto webReq = target.Get(isolate);
+                for (auto it = state.mHeadersMuxes.begin(); it != state.mHeadersMuxes.end(); ++it) {
+                    const auto& mux = *it;
+                    if (mux && !mux->webRequest.IsEmpty() && mux->webRequest.Get(isolate)->StrictEquals(webReq)) {
+                        std::erase_if(mux->entries,
+                                      [headersHandlerId](const auto& e) { return e.id == headersHandlerId; });
+                        if (mux->entries.empty()) {
+                            invokeMethod(context, webReq, "onHeadersReceived", {v8::Null(isolate)});
+                            state.mHeadersMuxes.erase(it);
+                        }
+                        break;
+                    }
+                }
             }
             break;
         case Disposer::Kind::ClearTimer:
@@ -308,7 +590,9 @@ void CloverContext::runDisposers(const v8::Local<v8::Context> context,
             break;
         }
         if (tryCatch.HasCaught()) {
-            errors.push_back(describeException(isolate, context, tryCatch));
+            JsRuntime::State::logger().error(
+                    "Plugin '{}' disposer threw: {}", record.name, describeException(isolate, context, tryCatch));
+            errors.push_back(extractExceptionMessage(isolate, context, tryCatch));
         }
     }
 }
@@ -351,9 +635,10 @@ auto PluginLifecycle::load(JsRuntime::State& state, const Plugin::JsPlugin& plug
         }
     }
 
-    v8::HandleScope    handleScope(isolate);
-    const auto         context = state.mContext.Get(isolate);
-    v8::Context::Scope contextScope(context);
+    const v8::Isolate::Scope isolateScope(isolate);
+    v8::HandleScope          handleScope(isolate);
+    const auto               context = state.mContext.Get(isolate);
+    v8::Context::Scope       contextScope(context);
 
     auto record          = std::make_unique<JsPluginRecord>();
     record->name         = name;
@@ -391,10 +676,14 @@ auto PluginLifecycle::load(JsRuntime::State& state, const Plugin::JsPlugin& plug
         const v8::TryCatch   tryCatch(isolate);
         v8::Local<v8::Value> exports;
         if (!state.requireModule(context, record->mainPath->string()).ToLocal(&exports)) {
-            const std::string err =
-                    tryCatch.HasCaught() ? describeException(isolate, context, tryCatch) : "module require failed";
+            if (tryCatch.HasCaught()) {
+                JsRuntime::State::logger().error(
+                        "Plugin '{}' failed to load: {}", name, describeException(isolate, context, tryCatch));
+            }
+            const std::string err = tryCatch.HasCaught() ? extractExceptionMessage(isolate, context, tryCatch)
+                                                         : "module require failed";
             rollback();
-            return jsError("failed to load '" + name + "': " + err, CommonErrorCode::CallbackFailed);
+            return jsError(err, CommonErrorCode::CallbackFailed);
         }
         if (!state.mModuleCache.IsEmpty()) {
             record->cacheKeys = newKeys(objectOwnKeys(context, state.mModuleCache.Get(isolate)), before);
@@ -407,13 +696,17 @@ auto PluginLifecycle::load(JsRuntime::State& state, const Plugin::JsPlugin& plug
             const bool           called =
                     entry.As<v8::Function>()->Call(context, context->Global(), 1, ctxArgs).ToLocal(&disposeVal);
             if (!called) {
-                const std::string err =
-                        tryCatch.HasCaught() ? describeException(isolate, context, tryCatch) : "plugin entry threw";
-                std::vector<std::string> disposeErrors;
-                CloverContext::runDisposers(context, *record, disposeErrors);
+                if (tryCatch.HasCaught()) {
+                    JsRuntime::State::logger().error(
+                            "Plugin '{}' entry threw: {}", name, describeException(isolate, context, tryCatch));
+                }
+                const std::string err = tryCatch.HasCaught() ? extractExceptionMessage(isolate, context, tryCatch)
+                                                             : "plugin entry threw";
                 CloverContext::invalidateBindings(state, record.get());
+                std::vector<std::string> disposeErrors;
+                CloverContext::runDisposers(state, context, *record, disposeErrors);
                 rollback();
-                return jsError("failed to load '" + name + "': " + err, CommonErrorCode::CallbackFailed);
+                return jsError(err, CommonErrorCode::CallbackFailed);
             }
             if (disposeVal->IsFunction()) {
                 Disposer disposer;
@@ -428,13 +721,17 @@ auto PluginLifecycle::load(JsRuntime::State& state, const Plugin::JsPlugin& plug
             v8::Local<v8::Value> ctxArgs[] = {ctxObj};
             v8::Local<v8::Value> loadResult;
             if (!functionProp(context, object, "onLoad")->Call(context, object, 1, ctxArgs).ToLocal(&loadResult)) {
-                const std::string err =
-                        tryCatch.HasCaught() ? describeException(isolate, context, tryCatch) : "plugin onLoad threw";
-                std::vector<std::string> disposeErrors;
-                CloverContext::runDisposers(context, *record, disposeErrors);
+                if (tryCatch.HasCaught()) {
+                    JsRuntime::State::logger().error(
+                            "Plugin '{}' onLoad threw: {}", name, describeException(isolate, context, tryCatch));
+                }
+                const std::string err = tryCatch.HasCaught() ? extractExceptionMessage(isolate, context, tryCatch)
+                                                             : "plugin onLoad threw";
                 CloverContext::invalidateBindings(state, record.get());
+                std::vector<std::string> disposeErrors;
+                CloverContext::runDisposers(state, context, *record, disposeErrors);
                 rollback();
-                return jsError("failed to load '" + name + "': " + err, CommonErrorCode::CallbackFailed);
+                return jsError(err, CommonErrorCode::CallbackFailed);
             }
             warnIfAsync(name, loadResult, "onLoad");
             if (const auto onUnload = functionProp(context, object, "onUnload"); !onUnload.IsEmpty()) {
@@ -472,9 +769,12 @@ auto PluginLifecycle::unload(JsRuntime::State& state, const std::string_view nam
         state.mRecords.erase(it);
     }
 
-    v8::HandleScope    handleScope(isolate);
-    const auto         context = state.mContext.Get(isolate);
-    v8::Context::Scope contextScope(context);
+    const v8::Isolate::Scope isolateScope(isolate);
+    v8::HandleScope          handleScope(isolate);
+    const auto               context = state.mContext.Get(isolate);
+    v8::Context::Scope       contextScope(context);
+
+    CloverContext::invalidateBindings(state, record.get());
 
     std::vector<std::string> errors;
     if (!record->onUnload.IsEmpty()) {
@@ -483,11 +783,13 @@ auto PluginLifecycle::unload(JsRuntime::State& state, const std::string_view nam
                                                                              : record->onUnloadThis.Get(isolate);
         (void) record->onUnload.Get(isolate)->Call(context, receiver, 0, nullptr);
         if (tryCatch.HasCaught()) {
-            errors.push_back("onUnload: " + describeException(isolate, context, tryCatch));
+            JsRuntime::State::logger().error(
+                    "Plugin '{}' onUnload threw: {}", name, describeException(isolate, context, tryCatch));
+            errors.push_back("onUnload: " + extractExceptionMessage(isolate, context, tryCatch));
         }
     }
 
-    CloverContext::runDisposers(context, *record, errors);
+    CloverContext::runDisposers(state, context, *record, errors);
 
     if (record->preloadPath) {
         for (auto& session: state.mSessions) {
@@ -495,7 +797,6 @@ auto PluginLifecycle::unload(JsRuntime::State& state, const std::string_view nam
         }
     }
 
-    CloverContext::invalidateBindings(state, record.get());
     purgeCache(state, context, *record);
 
     if (!errors.empty()) {

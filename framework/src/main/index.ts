@@ -1,3 +1,4 @@
+import {errorMessage} from "../shared/errors";
 import {Channel} from "../shared/ipc";
 import type {CloverLogger} from "../shared/log";
 import {readAboutAssets} from "./assets";
@@ -25,7 +26,17 @@ handle(Channel.PluginAction, (_event, request) => {
 handle(Channel.OpenTarget, (_event, request) => openTarget(binding, request));
 handle(Channel.EnsureWindowSize, (event) => ensureSettingsWindowWidth(event.sender));
 handle(Channel.GetGuard, () => binding.getGuardLocked());
-handle(Channel.SetGuard, async (_event, {families, locked}) => {
+handle(Channel.SetGuard, async (_event, request: unknown) => {
+    if (
+        request === null ||
+        typeof request !== "object" ||
+        typeof (request as { families?: unknown }).families !== "number" ||
+        !Number.isInteger((request as { families: number }).families) ||
+        typeof (request as { locked?: unknown }).locked !== "boolean"
+    ) {
+        throw new TypeError("Invalid SetGuard request");
+    }
+    const {families, locked} = request as { families: number; locked: boolean };
     const result = await binding.setGuardLocked(families, locked);
     broadcast(Channel.GuardChanged, result.lockedMask);
     return result;
@@ -42,6 +53,6 @@ handle(Channel.ListSystemFonts, () => listSystemFonts());
 setTimeout(() => {
     completeFonts(uiSettings, listSystemFonts).then(
         (saved) => saved && broadcastToAll(Channel.FontsChanged, saved),
-        (error: unknown) => logger.error(`completing the font settings failed: ${String(error)}`),
+        (error: unknown) => logger.error(`completing the font settings failed: ${errorMessage(error)}`),
     );
 }, 5000);

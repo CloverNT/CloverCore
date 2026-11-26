@@ -151,6 +151,14 @@ export class ModelMotion {
         this.drag = undefined;
     }
 
+    dispose(): void {
+        this.pause();
+        this.stage.removeEventListener("pointerdown", this.onPointerDown);
+        this.stage.removeEventListener("pointermove", this.onPointerMove);
+        this.stage.removeEventListener("pointerup", this.onPointerUp);
+        this.stage.removeEventListener("pointercancel", this.onPointerUp);
+    }
+
     private play(run: Animation): void {
         clearTimeout(this.timer);
         this.animation = {run, start: performance.now()};

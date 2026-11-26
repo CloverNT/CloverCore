@@ -1,5 +1,6 @@
 #include <CloverNT/API/Plugin/NativePlugin.hpp>
 
+#include <filesystem>
 #include <utility>
 
 namespace CloverNT::Plugin {

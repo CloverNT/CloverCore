@@ -1,8 +1,12 @@
 #include <CloverNT/API/Utils/System.hpp>
 
+#include <cstddef>
 #include <cwchar>
+#include <filesystem>
 #include <iterator>
 #include <string>
+#include <string_view>
+#include <utility>
 
 #include <Windows.h>
 
@@ -32,8 +36,7 @@ namespace {
 
     std::wstring deviceToDrive(const std::wstring& devicePath) {
         wchar_t     drives[512]{};
-        const DWORD count = GetLogicalDriveStringsW(std::size(drives) - 1, drives);
-        if (count == 0) {
+        if (const DWORD count = GetLogicalDriveStringsW(std::size(drives) - 1, drives); count == 0) {
             return {};
         }
         for (const wchar_t* p = drives; *p != L'\0'; p += std::wcslen(p) + 1) {

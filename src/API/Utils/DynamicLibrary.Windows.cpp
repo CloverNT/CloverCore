@@ -1,6 +1,12 @@
 #include <CloverNT/API/Utils/DynamicLibrary.hpp>
 
-#include <mutex>
+#include <cstdint>
+#include <expected>
+#include <filesystem>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
 
 #include <Windows.h>
 
@@ -14,9 +20,10 @@ namespace {
                           code);
     }
 
-    [[nodiscard]] auto dllLoadMutex() -> std::mutex& {
-        static std::mutex mutex;
-        return mutex;
+    [[nodiscard]] auto resolveAbsolutePath(std::filesystem::path const& path) -> std::filesystem::path {
+        std::error_code ec;
+        auto            absolutePath = std::filesystem::absolute(path, ec);
+        return ec ? path : absolutePath;
     }
 
 } // namespace
@@ -28,11 +35,12 @@ auto DynamicLibrary::load(std::filesystem::path const& path, std::filesystem::pa
                 ErrorCategory::DynamicLibrary, CommonErrorCode::AlreadyLoaded, "dynamic library is already loaded");
     }
 
-    std::lock_guard lock(dllLoadMutex());
+    const auto resolvedPath = resolveAbsolutePath(path);
 
     DLL_DIRECTORY_COOKIE cookie{};
     if (!searchDirectory.empty()) {
-        cookie = AddDllDirectory(searchDirectory.wstring().c_str());
+        const auto resolvedSearchDir = resolveAbsolutePath(searchDirectory);
+        cookie                       = AddDllDirectory(resolvedSearchDir.wstring().c_str());
         if (cookie == nullptr) {
             const auto code = GetLastError();
             return windowsError("AddDllDirectory", code);
@@ -44,7 +52,7 @@ auto DynamicLibrary::load(std::filesystem::path const& path, std::filesystem::pa
         flags |= LOAD_LIBRARY_SEARCH_USER_DIRS;
     }
 
-    const auto handle   = LoadLibraryExW(path.wstring().c_str(), nullptr, flags);
+    const auto handle   = LoadLibraryExW(resolvedPath.wstring().c_str(), nullptr, flags);
     const auto loadCode = handle == nullptr ? GetLastError() : ERROR_SUCCESS;
 
     if (cookie != nullptr) {

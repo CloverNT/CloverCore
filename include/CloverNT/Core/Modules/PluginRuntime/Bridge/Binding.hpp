@@ -3,31 +3,52 @@
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Support.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/JsRuntimeState.hpp>
 
+#include <atomic>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace CloverNT::Core::Modules::bridge {
 
+[[nodiscard]] inline auto stateOf(const v8::FunctionCallbackInfo<v8::Value>& args) -> JsRuntime::State* {
+    auto* cell = dataOf<JsRuntime::State::SelfCell>(args);
+    return cell != nullptr ? cell->state.load(std::memory_order_acquire) : nullptr;
+}
+
+[[nodiscard]] inline auto stateOf(const v8::PropertyCallbackInfo<v8::Value>& info) -> JsRuntime::State* {
+    if (!info.Data()->IsExternal()) {
+        return nullptr;
+    }
+    const auto* cell = static_cast<JsRuntime::State::SelfCell*>(info.Data().As<v8::External>()->Value());
+    return cell != nullptr ? cell->state.load(std::memory_order_acquire) : nullptr;
+}
+
 class JsPluginLoader final : public Plugin::PluginLoader {
 public:
-    JsPluginLoader(JsRuntime::State* state, std::string id) : mState(state), mId(std::move(id)) {}
+    JsPluginLoader(JsRuntime::State::SelfCell* cell, std::string id) : mCell(cell), mId(std::move(id)) {}
 
     [[nodiscard]] auto id() const -> std::string_view override {
         return mId;
     }
     [[nodiscard]] auto load(std::string_view name) -> Expected<void> override {
-        return mState->loaderLifecycle(mId, JsRuntime::State::LifecycleOp::Load, name);
+        const auto* state = mCell != nullptr ? mCell->state.load(std::memory_order_acquire) : nullptr;
+        return state != nullptr ? state->loaderLifecycle(mId, JsRuntime::State::LifecycleOp::Load, name)
+                                : jsError("JS runtime is not attached", CommonErrorCode::Inactive);
     }
     [[nodiscard]] auto unload(std::string_view name) -> Expected<void> override {
-        return mState->loaderLifecycle(mId, JsRuntime::State::LifecycleOp::Unload, name);
+        const auto* state = mCell != nullptr ? mCell->state.load(std::memory_order_acquire) : nullptr;
+        return state != nullptr ? state->loaderLifecycle(mId, JsRuntime::State::LifecycleOp::Unload, name)
+                                : jsError("JS runtime is not attached", CommonErrorCode::Inactive);
     }
     [[nodiscard]] auto reload(std::string_view name) -> Expected<void> override {
-        return mState->loaderLifecycle(mId, JsRuntime::State::LifecycleOp::Reload, name);
+        const auto* state = mCell != nullptr ? mCell->state.load(std::memory_order_acquire) : nullptr;
+        return state != nullptr ? state->loaderLifecycle(mId, JsRuntime::State::LifecycleOp::Reload, name)
+                                : jsError("JS runtime is not attached", CommonErrorCode::Inactive);
     }
 
 private:
-    JsRuntime::State* mState;
-    std::string       mId;
+    JsRuntime::State::SelfCell* mCell{};
+    std::string                 mId;
 };
 
 class Logger {
@@ -49,7 +70,6 @@ public:
                                 v8::Local<v8::Value>   module,
                                 v8::Local<v8::Context> context,
                                 void*                  priv);
-    static void cancelPendingGuardRequests(JsRuntime::State& state);
 
 private:
     static void runEventLoopOnce(const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -59,7 +79,8 @@ private:
 
 class Deasync {
 public:
-    [[nodiscard]] static auto create(JsRuntime::State& state, v8::Local<v8::Context> context) -> v8::Local<v8::Object>;
+    [[nodiscard]] static auto create(const JsRuntime::State& state, v8::Local<v8::Context> context)
+            -> v8::Local<v8::Object>;
 
 private:
     static void loopWhile(const v8::FunctionCallbackInfo<v8::Value>& args);

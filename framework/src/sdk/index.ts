@@ -1,4 +1,4 @@
-export type {Credential, Encryption, Packet, PacketApi} from "../clovernt.gen";
+export type {Credential, DllLoadInfo, Encryption, EventControl, O3Packet, Packet, PacketApi} from "../clovernt.gen";
 export type {CloverLogger} from "../shared/log";
 export type {
     CloverFolder,
@@ -31,13 +31,17 @@ export type {
 
 export {EventPriority} from "./events";
 export type {
+    CancellableEventContext,
+    CloverBuiltinEventMap,
+    CloverBuiltinEventName,
+    CloverBuiltinEventSpecs,
     CloverEventMap,
     CloverEvents,
-    CredentialEventPayload,
-    DllLoadPayload,
+    EventArgsOf,
+    EventContextFor,
     EventPriorityValue,
-    O3EventPayload,
-    PacketEventPayload,
+    MonitorEventArgsOf,
+    ReadonlyEventContext,
 } from "./events";
 export {definePlugin} from "./plugin";
 export type {

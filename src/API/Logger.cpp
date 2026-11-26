@@ -1,14 +1,23 @@
 #include <CloverNT/API/Logger.hpp>
 #include <CloverNT/Runtime/Kernel.h>
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <deque>
+#include <format>
 #include <fstream>
+#include <functional>
+#include <ios>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -70,7 +79,7 @@ namespace {
             auto line = LogProtocol::encode(message.level, message.title, message.text);
             if (const auto emit = consoleEmit()) {
                 line.push_back('\n');
-                emit(line.c_str()); // single process-wide exit; it holds its own lock
+                emit(line.c_str());
                 return;
             }
             std::lock_guard lock(mMutex);
@@ -124,73 +133,114 @@ namespace {
 
     class LogDispatcher {
     public:
-        LogDispatcher() : mWorker([this] { run(); }) {}
+        LogDispatcher() : mState(std::make_shared<State>()), mWorker([state = mState] { run(state); }) {}
 
         ~LogDispatcher() {
             {
-                std::lock_guard lock(mMutex);
-                mStopping = true;
+                std::lock_guard lock(mState->mutex);
+                mState->stopping = true;
             }
-            mWake.notify_all();
+            mState->wake.notify_all();
             if (mWorker.joinable()) {
+#ifdef CloverNT_SYSTEM_WINDOWS
+                {
+                    std::unique_lock lock(mState->mutex);
+                    (void) mState->done.wait_for(
+                            lock, std::chrono::milliseconds(200), [this] { return mState->exited; });
+                }
+                mWorker.detach();
+#else
                 mWorker.join();
+#endif
             }
         }
 
-        void enqueue(DispatchItem item) {
+        void enqueue(DispatchItem item) const {
+            bool runInline = false;
             {
-                std::lock_guard lock(mMutex);
-                mQueue.emplace_back(std::move(item));
+                std::lock_guard lock(mState->mutex);
+                if (mState->stopping) {
+                    runInline = true;
+                } else {
+                    mState->queue.emplace_back(std::move(item));
+                }
             }
-            mWake.notify_one();
+            if (runInline) {
+                dispatchItem(item);
+                return;
+            }
+            mState->wake.notify_one();
         }
 
-        void flush() {
-            std::unique_lock lock(mMutex);
-            mIdle.wait(lock, [this] { return mQueue.empty() && mActive == 0; });
+        [[nodiscard]] bool flush() const {
+            std::unique_lock lock(mState->mutex);
+            if (mState->workerThreadId == std::this_thread::get_id()) {
+                return false;
+            }
+            mState->idle.wait(lock,
+                              [this] { return mState->exited || (mState->queue.empty() && mState->active == 0); });
+            return true;
         }
 
     private:
-        void run() {
+        struct State {
+            std::mutex               mutex;
+            std::condition_variable  wake;
+            std::condition_variable  idle;
+            std::condition_variable  done;
+            std::deque<DispatchItem> queue;
+            std::thread::id          workerThreadId{};
+            std::size_t              active{};
+            bool                     stopping{};
+            bool                     exited{};
+        };
+
+        static void dispatchItem(const DispatchItem& item) {
+            for (const auto& consumer: item.consumers) {
+                if (!consumer) {
+                    continue;
+                }
+                try {
+                    consumer->consume(item.message, item.plainLine, item.coloredLine);
+                } catch (...) {}
+            }
+        }
+
+        static void run(const std::shared_ptr<State>& state) {
+            {
+                std::lock_guard lock(state->mutex);
+                state->workerThreadId = std::this_thread::get_id();
+            }
             for (;;) {
                 DispatchItem item;
                 {
-                    std::unique_lock lock(mMutex);
-                    mWake.wait(lock, [this] { return mStopping || !mQueue.empty(); });
-                    if (mStopping && mQueue.empty()) {
+                    std::unique_lock lock(state->mutex);
+                    state->wake.wait(lock, [&state] { return state->stopping || !state->queue.empty(); });
+                    if (state->stopping && state->queue.empty()) {
+                        state->exited = true;
+                        state->idle.notify_all();
+                        state->done.notify_all();
                         break;
                     }
-                    item = std::move(mQueue.front());
-                    mQueue.pop_front();
-                    ++mActive;
+                    item = std::move(state->queue.front());
+                    state->queue.pop_front();
+                    ++state->active;
                 }
 
-                for (const auto& consumer: item.consumers) {
-                    if (!consumer) {
-                        continue;
-                    }
-                    try {
-                        consumer->consume(item.message, item.plainLine, item.coloredLine);
-                    } catch (...) {}
-                }
+                dispatchItem(item);
 
                 {
-                    std::lock_guard lock(mMutex);
-                    --mActive;
-                    if (mQueue.empty() && mActive == 0) {
-                        mIdle.notify_all();
+                    std::lock_guard lock(state->mutex);
+                    --state->active;
+                    if (state->queue.empty() && state->active == 0) {
+                        state->idle.notify_all();
                     }
                 }
             }
         }
 
-        std::mutex               mMutex;
-        std::condition_variable  mWake;
-        std::condition_variable  mIdle;
-        std::deque<DispatchItem> mQueue;
-        std::thread              mWorker;
-        std::size_t              mActive{};
-        bool                     mStopping{};
+        std::shared_ptr<State> mState;
+        std::thread            mWorker;
     };
 
     LogDispatcher& dispatcher() {
@@ -313,7 +363,9 @@ std::vector<std::shared_ptr<LogConsumer>> Logger::consumers() const {
 }
 
 void Logger::flush() const {
-    dispatcher().flush();
+    if (!dispatcher().flush()) {
+        return;
+    }
     for (auto& consumer: consumers()) {
         if (consumer) {
             consumer->flush();
@@ -322,7 +374,7 @@ void Logger::flush() const {
 }
 
 void Logger::flushAll() {
-    dispatcher().flush();
+    (void) dispatcher().flush();
 }
 
 void Logger::logString(LogLevel level, std::string message) const noexcept {

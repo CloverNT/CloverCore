@@ -2,8 +2,15 @@
 #include <CloverNT/Core/Modules/HookRuntime.hpp>
 #include <CloverNT/Runtime/Kernel.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <mutex>
 #include <ranges>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <Mortis/Process.hpp>
 
@@ -126,26 +133,21 @@ public:
         return {};
     }
 
-    auto remove() -> Expected<void> {
+    auto detachForRemove() -> Expected<std::shared_ptr<Memory::Detail::ResourcePayload>> {
         if (mRemoved) {
-            return {};
+            return std::shared_ptr<Memory::Detail::ResourcePayload>{};
         }
 
         if (mEnabled) {
             if (auto result = disableImpl(); !result) {
-                return result;
+                return unexpected(result.error());
             }
             mEnabled = false;
         }
 
-        if (mPayload) {
-            mPayload->quiesce();
-        }
-
         mRemoved   = true;
         mSuspended = false;
-        mPayload.reset();
-        return {};
+        return std::exchange(mPayload, nullptr);
     }
 
 private:
@@ -191,12 +193,11 @@ namespace {
             if (mHandle == 0) {
                 return {};
             }
-            const bool ok = CloverHookRemove(mHandle) != 0;
-            mHandle       = 0;
-            if (!ok) {
+            if (CloverHookRemove(mHandle) == 0) {
                 return unexpected(
                         Memory::makeMemoryError(Memory::ErrorCode::HookRemoveFailed, "Inline hook remove failed"));
             }
+            mHandle = 0;
             return {};
         }
 
@@ -330,22 +331,36 @@ auto HookRuntime::onLoad() -> Expected<void> {
 }
 
 auto HookRuntime::onUnload() -> Expected<void> {
-    std::lock_guard lock(mMutex);
+    std::vector<std::shared_ptr<Memory::Detail::ResourcePayload>> payloads;
+    std::string                                                   errors;
+    {
+        std::lock_guard lock(mMutex);
 
-    std::string errors;
-    for (auto& [id, resource]: std::views::reverse(mResources)) {
-        if (auto result = resource->remove(); !result) {
-            appendError(errors, "Resource " + std::to_string(id) + ": " + result.error().message);
+        for (auto& [id, resource]: std::views::reverse(mResources)) {
+            if (auto result = resource->detachForRemove(); !result) {
+                appendError(errors, "Resource " + std::to_string(id) + ": " + result.error().message);
+            } else if (result.value()) {
+                payloads.push_back(std::move(result.value()));
+            }
+        }
+
+        if (errors.empty()) {
+            mResources.clear();
+            mPluginResources.clear();
+            mNextId = 1;
+        }
+    }
+
+    for (auto& payload: payloads) {
+        if (payload) {
+            payload->quiesce();
+            payload.reset();
         }
     }
 
     if (!errors.empty()) {
         return unexpected(Memory::makeMemoryError(Memory::ErrorCode::HookRemoveFailed, std::move(errors)));
     }
-
-    mResources.clear();
-    mPluginResources.clear();
-    mNextId = 1;
     return {};
 }
 
@@ -404,56 +419,71 @@ auto HookRuntime::resolveOwner(const std::weak_ptr<Plugin::Plugin>& owner) -> Ex
 }
 
 auto HookRuntime::addResource(std::unique_ptr<RuntimeResource> resource) -> Expected<Memory::ResourceId> {
-    std::lock_guard lock(mMutex);
-    if (!resource) {
-        return unexpected(Memory::makeMemoryError(Memory::ErrorCode::InvalidArgument, "Resource is null"));
-    }
-    if (!isEnabled()) {
-        return unexpected(Memory::makeMemoryError(Memory::ErrorCode::RuntimeInactive, "Memory runtime is not active"));
-    }
+    std::shared_ptr<Memory::Detail::ResourcePayload> rollbackPayload;
+    Expected<Memory::ResourceId>                     outcome =
+            unexpected(Memory::makeMemoryError(Memory::ErrorCode::HookInstallFailed, "Unreachable"));
+    {
+        std::lock_guard lock(mMutex);
+        if (!resource) {
+            return unexpected(Memory::makeMemoryError(Memory::ErrorCode::InvalidArgument, "Resource is null"));
+        }
+        if (!isEnabled()) {
+            return unexpected(
+                    Memory::makeMemoryError(Memory::ErrorCode::RuntimeInactive, "Memory runtime is not active"));
+        }
 
-    const auto id    = mNextId++;
-    const auto owner = resource->owner();
-    auto*      raw   = resource.get();
-    try {
-        mResources.emplace(id, std::move(resource));
-        mPluginResources[owner].emplace(id);
-    } catch (...) {
-        mResources.erase(id);
-        if (const auto ownerIt = mPluginResources.find(owner); ownerIt != mPluginResources.end()) {
-            ownerIt->second.erase(id);
-            if (ownerIt->second.empty()) {
-                mPluginResources.erase(ownerIt);
+        const auto id    = mNextId++;
+        const auto owner = resource->owner();
+        auto*      raw   = resource.get();
+        try {
+            mResources.emplace(id, std::move(resource));
+            mPluginResources[owner].emplace(id);
+        } catch (...) {
+            mResources.erase(id);
+            if (const auto ownerIt = mPluginResources.find(owner); ownerIt != mPluginResources.end()) {
+                ownerIt->second.erase(id);
+                if (ownerIt->second.empty()) {
+                    mPluginResources.erase(ownerIt);
+                }
             }
+            return unexpected(fromCurrentException(ErrorCategory::Memory));
         }
-        return unexpected(fromCurrentException(ErrorCategory::Memory));
+
+        auto rollbackAfterEnableFailure = [&](Error const& enableError,
+                                              std::string  prefix) -> Expected<Memory::ResourceId> {
+            std::string rollbackErrors;
+            if (auto removed = detachResourceLocked(id); !removed) {
+                appendError(rollbackErrors, removed.error().message);
+            } else {
+                rollbackPayload = std::move(removed.value());
+            }
+
+            if (!rollbackErrors.empty()) {
+                return unexpected(Memory::makeMemoryError(Memory::ErrorCode::HookInstallFailed,
+                                                          std::move(prefix) + enableError.message +
+                                                                  "\nRollback failed:\n" + rollbackErrors));
+            }
+            return unexpected(enableError);
+        };
+
+        try {
+            if (auto enabled = raw->enable(); !enabled) {
+                outcome = rollbackAfterEnableFailure(enabled.error(),
+                                                     "Failed to enable resource " + std::to_string(id) + ": ");
+            } else {
+                outcome = id;
+            }
+        } catch (...) {
+            outcome = rollbackAfterEnableFailure(fromCurrentException(ErrorCategory::Memory),
+                                                 "Resource " + std::to_string(id) + " enable threw: ");
+        }
     }
 
-    auto rollbackAfterEnableFailure = [&](Error const& enableError,
-                                          std::string  prefix) -> Expected<Memory::ResourceId> {
-        std::string rollbackErrors;
-        if (auto removed = removeResourceLocked(id); !removed) {
-            appendError(rollbackErrors, removed.error().message);
-        }
-
-        if (!rollbackErrors.empty()) {
-            return unexpected(Memory::makeMemoryError(Memory::ErrorCode::HookInstallFailed,
-                                                      std::move(prefix) + enableError.message + "\nRollback failed:\n" +
-                                                              rollbackErrors));
-        }
-        return unexpected(enableError);
-    };
-
-    try {
-        if (auto enabled = raw->enable(); !enabled) {
-            return rollbackAfterEnableFailure(enabled.error(),
-                                              "Failed to enable resource " + std::to_string(id) + ": ");
-        }
-    } catch (...) {
-        return rollbackAfterEnableFailure(fromCurrentException(ErrorCategory::Memory),
-                                          "Resource " + std::to_string(id) + " enable threw: ");
+    if (rollbackPayload) {
+        rollbackPayload->quiesce();
+        rollbackPayload.reset();
     }
-    return id;
+    return outcome;
 }
 
 
@@ -462,15 +492,17 @@ auto HookRuntime::findResource(const Memory::ResourceId id) -> RuntimeResource* 
     return it == mResources.end() ? nullptr : it->second.get();
 }
 
-auto HookRuntime::removeResourceLocked(const Memory::ResourceId id) -> Expected<void> {
+auto HookRuntime::detachResourceLocked(const Memory::ResourceId id)
+        -> Expected<std::shared_ptr<Memory::Detail::ResourcePayload>> {
     const auto it = mResources.find(id);
     if (it == mResources.end()) {
         return unexpected(Memory::makeMemoryError(Memory::ErrorCode::InvalidHandle, "Invalid resource handle"));
     }
 
-    const auto owner = it->second->owner();
-    if (const auto result = it->second->remove(); !result) {
-        return unexpected(result.error());
+    const auto owner    = it->second->owner();
+    auto       detached = it->second->detachForRemove();
+    if (!detached) {
+        return unexpected(detached.error());
     }
 
     if (const auto ownerIt = mPluginResources.find(owner); ownerIt != mPluginResources.end()) {
@@ -480,7 +512,7 @@ auto HookRuntime::removeResourceLocked(const Memory::ResourceId id) -> Expected<
         }
     }
     mResources.erase(it);
-    return {};
+    return std::move(detached.value());
 }
 
 auto HookRuntime::createInlineHook(Memory::Address                                  target,
@@ -592,8 +624,20 @@ auto HookRuntime::disableResource(const Memory::ResourceId id) -> Expected<void>
 }
 
 auto HookRuntime::removeResource(const Memory::ResourceId id) -> Expected<void> {
-    std::lock_guard lock(mMutex);
-    return removeResourceLocked(id);
+    std::shared_ptr<Memory::Detail::ResourcePayload> payload;
+    {
+        std::lock_guard lock(mMutex);
+        auto            detached = detachResourceLocked(id);
+        if (!detached) {
+            return unexpected(detached.error());
+        }
+        payload = std::move(detached.value());
+    }
+    if (payload) {
+        payload->quiesce();
+        payload.reset();
+    }
+    return {};
 }
 
 bool HookRuntime::isResourceEnabled(const Memory::ResourceId id) {
@@ -672,19 +716,32 @@ auto HookRuntime::resumePluginResources(const std::string_view pluginName) -> Ex
 }
 
 auto HookRuntime::clearPluginResources(const std::string_view pluginName) -> Expected<void> {
-    std::lock_guard lock(mMutex);
-    const auto      ownerIt = mPluginResources.find(pluginName);
-    if (ownerIt == mPluginResources.end()) {
-        return {};
-    }
+    std::vector<std::shared_ptr<Memory::Detail::ResourcePayload>> payloads;
+    std::string                                                   errors;
+    {
+        std::lock_guard lock(mMutex);
+        const auto      ownerIt = mPluginResources.find(pluginName);
+        if (ownerIt == mPluginResources.end()) {
+            return {};
+        }
 
-    std::string errors;
-    for (const auto ids = std::vector(ownerIt->second.begin(), ownerIt->second.end());
-         const auto id: std::views::reverse(ids)) {
-        if (auto result = removeResourceLocked(id); !result) {
-            appendError(errors, "Resource " + std::to_string(id) + ": " + result.error().message);
+        for (const auto ids = std::vector(ownerIt->second.begin(), ownerIt->second.end());
+             const auto id: std::views::reverse(ids)) {
+            if (auto result = detachResourceLocked(id); !result) {
+                appendError(errors, "Resource " + std::to_string(id) + ": " + result.error().message);
+            } else if (result.value()) {
+                payloads.push_back(std::move(result.value()));
+            }
         }
     }
+
+    for (auto& payload: payloads) {
+        if (payload) {
+            payload->quiesce();
+            payload.reset();
+        }
+    }
+
     if (!errors.empty()) {
         return unexpected(Memory::makeMemoryError(
                 Memory::ErrorCode::HookRemoveFailed,

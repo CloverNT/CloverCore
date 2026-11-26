@@ -146,6 +146,9 @@ class AboutStage {
         this.polarLight = new PolarLight(polarCanvas);
 
         void invoke(Channel.GetRuntimeInfo).then((info) => {
+            if (this.disposed) {
+                return;
+            }
             const coreVersion = h("button", {class: "clovernt-about__ver-btn", type: "button", onClick: developerModeClicker()}, info.version);
             card.append(
                 aboutRow("CloverCore", coreVersion),
@@ -182,7 +185,8 @@ class AboutStage {
     dispose(): void {
         this.disposed = true;
         this.polarLight.loop.stop();
-        this.model?.loop.stop();
+        this.model?.dispose();
+        this.model = undefined;
         this.element.remove();
         for (const child of this.container.children) {
             child.removeAttribute(HIDDEN_ATTRIBUTE);
@@ -202,9 +206,12 @@ export class AboutPage {
         }
         const container = document.querySelector<HTMLElement>(".setting-main .about-container");
         if (!container) {
+            this.stage?.dispose();
+            this.stage = undefined;
             return;
         }
         if (this.stage?.container !== container) {
+            this.stage?.dispose();
             this.stage = new AboutStage(container);
             container.append(this.stage.element);
         }

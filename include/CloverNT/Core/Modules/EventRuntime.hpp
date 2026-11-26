@@ -3,12 +3,11 @@
 #include <CloverNT/API/Events/EventBus.hpp>
 #include <CloverNT/Core/Modules/ModuleBase.hpp>
 
-#include <condition_variable>
+#include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
-#include <optional>
-#include <set>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -23,60 +22,31 @@ public:
     [[nodiscard]] auto onEnable() -> Expected<void> override;
     [[nodiscard]] auto onDisable() -> Expected<void> override;
 
-    [[nodiscard]] auto registerEvent(std::string_view eventName, const std::weak_ptr<Plugin::Plugin>& owner = {})
-            -> Expected<void>;
+    [[nodiscard]] auto addSlot(std::string_view topic, CloverNT::Event::ListenerSlotPtr slot)
+            -> Expected<CloverNT::Event::SubscriptionId>;
+    bool               removeSlot(CloverNT::Event::SubscriptionId id) noexcept;
+    [[nodiscard]] bool hasSubscription(CloverNT::Event::SubscriptionId id) const noexcept;
+    [[nodiscard]] auto listenerCount(std::string_view topic = {}) const noexcept -> std::size_t;
+    [[nodiscard]] auto topics() const -> std::vector<std::string>;
 
-    [[nodiscard]] auto addListener(CloverNT::Event::ListenerPtr const& listener, std::string_view eventName) -> Expected<void>;
-    [[nodiscard]] auto removeListener(CloverNT::Event::ListenerPtr const& listener) -> Expected<void>;
-    [[nodiscard]] auto removeListener(CloverNT::Event::ListenerId id) -> Expected<void>;
-    [[nodiscard]] auto getListener(CloverNT::Event::ListenerId id) const -> CloverNT::Event::ListenerPtr;
-    [[nodiscard]] bool hasListener(CloverNT::Event::ListenerId id) const;
-    [[nodiscard]] auto getListenerCount(std::string_view eventName = {}) const -> std::size_t;
-    [[nodiscard]] auto events() const -> std::vector<std::string>;
+    [[nodiscard]] auto dispatch(CloverNT::Event::EventInvocation& inv) -> Expected<bool>;
 
-    void               publish(CloverNT::Event::Event& event, std::string_view eventName);
     [[nodiscard]] auto clearPlugin(std::string_view pluginName) -> Expected<void>;
     [[nodiscard]] auto waitPluginIdle(std::string_view pluginName) -> Expected<void>;
 
 private:
-    class ListenerActivity {
-    public:
-        ListenerActivity(EventRuntime& bus, std::string pluginName) noexcept;
-        ListenerActivity(ListenerActivity const&)            = delete;
-        ListenerActivity& operator=(ListenerActivity const&) = delete;
-        ListenerActivity(ListenerActivity&& other) noexcept;
-        ListenerActivity& operator=(ListenerActivity&& other) noexcept;
-        ~ListenerActivity();
+    using SlotList          = std::vector<CloverNT::Event::ListenerSlotPtr>;
+    using ImmutableSlotList = std::shared_ptr<const SlotList>;
 
-        [[nodiscard]] auto pluginName() const noexcept -> std::string const&;
-
-    private:
-        void reset() noexcept;
-
-        EventRuntime* mBus{};
-        std::string mPluginName;
+    struct EventChannel {
+        ImmutableSlotList snapshot;
     };
 
-    struct ListenerComparator {
-        bool operator()(CloverNT::Event::ListenerPtr const& lhs, CloverNT::Event::ListenerPtr const& rhs) const;
-    };
+    void compactConsumedOnceSlots(std::string_view topic) noexcept;
 
-    struct EventInfo {
-        std::string                                      owner;
-        std::set<CloverNT::Event::ListenerPtr, ListenerComparator> listeners;
-    };
-
-    void               finishListenerActivity(std::string const& pluginName);
-    [[nodiscard]] auto beginListenerActivity(CloverNT::Event::ListenerPtr const& listener) -> std::optional<ListenerActivity>;
-
-    mutable std::recursive_mutex                                    mMutex;
-    std::condition_variable_any                                     mPluginIdle;
-    std::map<std::string, EventInfo, std::less<>>                   mEvents;
-    std::unordered_map<CloverNT::Event::ListenerId, CloverNT::Event::ListenerPtr>       mListeners;
-    std::unordered_map<CloverNT::Event::ListenerId, std::string>              mListenerOwners;
-    std::map<std::string, std::set<CloverNT::Event::ListenerId>, std::less<>> mPluginListeners;
-    std::map<std::string, std::set<std::string>, std::less<>>       mPluginEvents;
-    std::map<std::string, std::size_t, std::less<>>                 mActivePluginListeners;
+    mutable std::shared_mutex                                        mMutex;
+    std::map<std::string, EventChannel, std::less<>>                 mChannels;
+    std::unordered_map<CloverNT::Event::SubscriptionId, std::string> mSlotTopics;
 };
 
 } // namespace CloverNT::Core::Modules

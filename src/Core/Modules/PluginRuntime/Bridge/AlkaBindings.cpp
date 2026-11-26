@@ -1,19 +1,23 @@
 #include <CloverNT/API/Events/EventBus.hpp>
-#include <CloverNT/API/Events/NamedEvent.hpp>
 #include <CloverNT/API/Nt/Packet.hpp>
 #include <CloverNT/API/Plugin/JsPlugin.hpp>
 #include <CloverNT/API/Plugin/NativePlugin.hpp>
 #include <CloverNT/API/Plugin/PluginManager.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/AlkaBindings.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Binding.hpp>
-#include <CloverNT/Core/Modules/PluginRuntime/Bridge/EventExports.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Events.hpp>
+#include <CloverNT/Core/Modules/PluginRuntime/Bridge/ReflectBridge.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/JsRuntimeState.hpp>
 
+#include <Alka/Alka.hpp>
+
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -21,10 +25,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <Alka/Alka.hpp>
-#include <nlohmann/json.hpp>
-
 
 namespace CloverNT::Core::Modules::bridge {
 
@@ -206,13 +206,13 @@ bool PluginManagerApi::registerLoader(std::string id, const Alka::Object& config
     if (mState == nullptr || !config.valid()) {
         return false;
     }
-    v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    mState->registerLoaderCallbacks(id, config.local(isolate).As<v8::Object>());
-    if (const auto result = Plugin::PluginManager::registerLoader(std::make_shared<JsPluginLoader>(mState, id));
+    if (const auto result =
+                Plugin::PluginManager::registerLoader(std::make_shared<JsPluginLoader>(mState->selfCell(), id));
         !result) {
-        mState->unregisterLoaderCallbacks(id);
         return false;
     }
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    mState->registerLoaderCallbacks(std::move(id), config.local(isolate).As<v8::Object>());
     return true;
 }
 
@@ -221,75 +221,151 @@ bool PluginManagerApi::unregisterLoader(std::string id) const {
         return false;
     }
     const auto result = Plugin::PluginManager::unregisterLoader(id);
-    mState->unregisterLoaderCallbacks(id);
+    if (result) {
+        mState->unregisterLoaderCallbacks(id);
+    }
     return result.has_value();
 }
 
-auto EventsApi::on(std::string                          name,
-                   Alka::Function<void(Alka::Value)>    callback,
-                   const Event::EventPriority priority) -> double {
-    return subscribe(std::move(name), std::move(callback), false, priority);
+auto EventsApi::on(std::string name, JsEventCallback callback, const Event::EventPriority priority) -> double {
+    return subscribe(name, std::move(callback), false, priority);
 }
 
-auto EventsApi::once(std::string                          name,
-                     Alka::Function<void(Alka::Value)>    callback,
-                     const Event::EventPriority priority) -> double {
-    return subscribe(std::move(name), std::move(callback), true, priority);
+auto EventsApi::once(std::string name, JsEventCallback callback, const Event::EventPriority priority) -> double {
+    return subscribe(name, std::move(callback), true, priority);
+}
+
+auto EventsApi::monitor(std::string name, JsEventCallback callback) -> double {
+    return subscribe(name, std::move(callback), false, Event::EventPriority::Monitor);
 }
 
 auto EventsApi::off(const double id) -> bool {
-    return mState != nullptr && mState->removeEventSubscription(static_cast<std::uint64_t>(id));
+    if (mState == nullptr || !(id > 0.0)) {
+        return false;
+    }
+    const auto subId   = static_cast<Event::SubscriptionId>(id);
+    const bool removed = Event::EventBus::off(subId);
+    mState->untrackJsSubscription(subId);
+    return removed;
 }
 
-auto EventsApi::emit(std::string name, const Alka::Value& payload) -> bool {
+auto EventsApi::emit(const Alka::CallInfo& call, std::string name, Alka::Rest<Alka::Value> args) -> bool {
     if (mState == nullptr) {
         return false;
     }
-    v8::Isolate*               isolate = v8::Isolate::GetCurrent();
-    const v8::HandleScope      handleScope(isolate);
-    const auto                 context = isolate->GetCurrentContext();
-    const v8::Local<v8::Value> live = payload.valid() ? payload.local(isolate) : v8::Undefined(isolate).As<v8::Value>();
+    const auto topic = Event::EventBus::normalizeEmitTopic(name, mOwnerName, /*normalizeBare=*/true);
+    if (!topic) {
+        throw Alka::JsException(topic.error().message);
+    }
 
-    nlohmann::json    json = jsonFromV8(isolate, context, live);
-    LivePayload       token{live};
-    Event::NamedEvent event(std::move(name), std::move(json));
-    event.setBridgeToken(&token);
-    Event::EventBus::publish(event, event.name());
-    return event.isCancelled();
+    v8::Isolate* const    isolate = call.mIsolate != nullptr ? call.mIsolate : v8::Isolate::GetCurrent();
+    const v8::HandleScope handleScope(isolate);
+    const auto            context = !call.mContext.IsEmpty() ? call.mContext : isolate->GetCurrentContext();
+
+    std::vector<v8::Local<v8::Value>> rawJsArgs;
+    rawJsArgs.reserve(args.size());
+    for (const auto& val: args) {
+        rawJsArgs.push_back(val.valid() && val.belongsTo(isolate) ? val.local(isolate)
+                                                                  : v8::Undefined(isolate).As<v8::Value>());
+    }
+
+    auto materialize = [&](const Reflect::MarshalContext& mctx) -> Expected<std::vector<Reflect::BridgeValue>> {
+        std::vector<Reflect::BridgeValue> out;
+        out.reserve(rawJsArgs.size());
+        for (std::size_t i = 0; i < rawJsArgs.size(); ++i) {
+            auto converted = bridgeValueFromV8(isolate, context, rawJsArgs[i], mctx.activeLease);
+            if (!converted) {
+                return unexpected(
+                        Reflect::prependErrorPath(std::move(converted).error(), "arg[" + std::to_string(i) + "]"));
+            }
+            out.push_back(std::move(*converted));
+        }
+        return out;
+    };
+
+    auto writeBack = [&](const std::span<const Reflect::BridgeValue> updated,
+                         Reflect::MarshalContext&) -> Expected<void> {
+        const std::size_t limit = std::min(rawJsArgs.size(), updated.size());
+        for (std::size_t i = 0; i < limit; ++i) {
+            const auto orig = rawJsArgs[i];
+            if (orig.IsEmpty() || !orig->IsObject() || orig->IsFunction()) {
+                continue;
+            }
+            if (orig->IsArray() && updated[i].isArray()) {
+                const auto  arr   = orig.As<v8::Array>();
+                const auto& items = updated[i].asArray();
+                (void) arr->Set(context,
+                                v8Str(isolate, "length"),
+                                v8::Integer::NewFromUnsigned(isolate, static_cast<std::uint32_t>(items.size())));
+                for (std::size_t k = 0; k < items.size(); ++k) {
+                    auto elemJs = bridgeValueToV8(isolate, context, items[k]);
+                    if (!elemJs) {
+                        return unexpected(elemJs.error());
+                    }
+                    (void) arr->Set(context, static_cast<std::uint32_t>(k), *elemJs);
+                }
+            } else if (!orig->IsArray() && !orig->IsArrayBufferView() && !orig->IsArrayBuffer() &&
+                       updated[i].isObject()) {
+                if (auto res = writeBridgeFieldsToV8Object(isolate, context, orig.As<v8::Object>(), updated[i]); !res) {
+                    return res;
+                }
+            }
+        }
+        return {};
+    };
+
+    const v8::Local<v8::Value> dummyArg{};
+    const void* const          fastPtr =
+            rawJsArgs.empty() ? static_cast<const void*>(&dummyArg) : static_cast<const void*>(rawJsArgs.data());
+
+    const Reflect::ScopedOwnerPlugin ownerGuard(mOwnerName);
+    Event::EventInvocation           inv(*topic,
+                                         mOwnerName,
+                                         /*cancellable=*/true,
+                                         /*mutablePayload=*/!rawJsArgs.empty(),
+                                         /*nativeArgs=*/{},
+                                         std::move(materialize),
+                                         std::move(writeBack),
+                                         isolate,
+                                         fastPtr,
+                                         rawJsArgs.size());
+
+    const auto dispatched = Event::EventBus::dispatchPluginInvocation(inv);
+    if (!dispatched) {
+        throw Alka::JsException(dispatched.error().message);
+    }
+    return *dispatched;
 }
 
-auto EventsApi::subscribe(std::string                          name,
-                          Alka::Function<void(Alka::Value)>    callback,
-                          const bool                           once,
-                          const CloverNT::Event::EventPriority priority) -> double {
+auto EventsApi::subscribe(const std::string&         name,
+                          JsEventCallback            callback,
+                          const bool                 once,
+                          const Event::EventPriority priority) -> double {
     if (mState == nullptr || !callback.valid()) {
-        return -1;
+        return -1.0;
     }
-    v8::Isolate*                  isolate = v8::Isolate::GetCurrent();
-    const v8::Local<v8::Function> fn      = callback.local(isolate).As<v8::Function>();
-
-    auto owner = Plugin::PluginManager::getPlugin(mOwnerName);
-    if (!owner) {
-        owner = Plugin::PluginManager::getPlugin("CloverCore");
+    const auto topic = Event::EventBus::normalizeSubscribeTopic(name, mOwnerName, /*normalizeBare=*/true);
+    if (!topic) {
+        throw Alka::JsException(topic.error().message);
     }
 
-    const NativeEventExport* nativeExport = findNativeExport(name);
-    const std::string        key          = nativeExport != nullptr ? std::string(nativeExport->busKey) : name;
-    (void) Event::EventBus::registerEvent(key, Plugin::PluginManager::getPlugin("CloverCore"));
+    const auto subId    = Event::EventBus::allocateSubscriptionId();
+    auto       activity = Reflect::acquirePluginActivity(mOwnerName);
+    auto       slot     = std::make_shared<JsListenerSlot>(subId,
+                                                           priority,
+                                                           once,
+                                                           mOwnerName,
+                                                           std::move(activity),
+                                                           mState->selfCell(),
+                                                           std::move(callback),
+                                                           mState->mAlkaDispatcher);
 
-    auto                listener = std::make_shared<JsListener>(mState->mEventChannel, nativeExport, priority, owner);
-    const std::uint64_t subId = listener->id();
-    if (auto result = Event::EventBus::addListener(listener, key); !result) {
-        return -1;
+    const auto added = Event::EventBus::addSlot(*topic, std::move(slot));
+    if (!added) {
+        throw Alka::JsException(added.error().message);
     }
-
-    JsRuntime::State::JsSubscription subscription;
-    subscription.jsFn.Reset(isolate, fn);
-    subscription.jsName    = std::move(name);
-    subscription.once      = once;
-    subscription.ownerName = mOwnerName;
-    mState->mEventSubs.emplace(subId, std::move(subscription));
-    return static_cast<double>(subId);
+    mState->trackJsSubscription(*added);
+    return static_cast<double>(*added);
 }
 
 namespace {
@@ -422,15 +498,7 @@ namespace {
 
 void ensureAlkaClasses(v8::Isolate* isolate) {
     const v8::HandleScope scope(isolate);
-    Alka::registerClass<JsLogger,
-                        PluginManagerApi,
-                        EventsApi,
-                        PacketApi,
-                        PluginListDto,
-                        PluginScanDto,
-                        PluginActionResultDto,
-                        Nt::Packet,
-                        Nt::Credential>(isolate);
+    Alka::registerClass<JsLogger, PluginManagerApi, EventsApi, PacketApi, JsEventControl>(isolate);
 }
 
 auto mintPluginManager(const v8::Local<v8::Context> context, JsRuntime::State& state) -> v8::Local<v8::Value> {
@@ -457,7 +525,6 @@ auto mintEvents(const v8::Local<v8::Context> context, JsRuntime::State& state, c
 }
 
 void clearBindings(JsRuntime::State& state) {
-    LinkedBinding::cancelPendingGuardRequests(state);
     const std::lock_guard lock(gMutex);
     registry().erase(&state);
 }

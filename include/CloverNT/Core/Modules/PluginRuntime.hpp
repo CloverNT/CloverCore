@@ -4,7 +4,9 @@
 #include <CloverNT/API/Plugin/PluginManager.hpp>
 #include <CloverNT/Core/Modules/ModuleBase.hpp>
 
+#include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>

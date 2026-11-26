@@ -3,10 +3,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <concepts>
+#include <chrono>
 #include <cstddef>
-#include <cstdlib>
-#include <exception>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -119,7 +118,7 @@ namespace Detail {
         explicit OriginalFunction(void** slot) noexcept : mSlot(slot) {}
 
         auto operator()(Args... args) const -> R {
-            auto* fn = reinterpret_cast<Pointer>(*mSlot);
+            auto* fn = get();
             if (fn == nullptr) {
                 if constexpr (std::is_void_v<R>) {
                     return;
@@ -136,33 +135,59 @@ namespace Detail {
         }
 
         [[nodiscard]] auto get() const noexcept -> Pointer {
-            return reinterpret_cast<Pointer>(*mSlot);
+            return reinterpret_cast<Pointer>(std::atomic_ref<void*>(*mSlot).load(std::memory_order_acquire));
         }
 
     private:
         void** mSlot{};
     };
 
+    template <typename R>
+    inline constexpr bool IsSafeMemberFreeReturn = [] {
+#if defined(CloverNT_SYSTEM_WINDOWS) && defined(CloverNT_ARCH_X64)
+        if constexpr (std::is_void_v<R> || std::is_reference_v<R> || std::is_scalar_v<R>) {
+            return true;
+        } else {
+            return std::is_trivial_v<R> && std::is_standard_layout_v<R> &&
+                   (sizeof(R) == 1 || sizeof(R) == 2 || sizeof(R) == 4 || sizeof(R) == 8);
+        }
+#else
+        return true;
+#endif
+    }();
+
     template <typename MemFnPtr>
     struct MemberToFreeSig;
 
     template <typename R, typename C, typename... Args>
     struct MemberToFreeSig<R (C::*)(Args...)> {
+        static_assert(IsSafeMemberFreeReturn<R>,
+                      "MSVC x64 member-function hooking with hidden sret return type has incompatible RCX/RDX ABI; "
+                      "hook with an explicit free-function signature taking (C*, R*, Args...) instead.");
         using Type = R(C*, Args...);
     };
 
     template <typename R, typename C, typename... Args>
     struct MemberToFreeSig<R (C::*)(Args...) const> {
+        static_assert(IsSafeMemberFreeReturn<R>,
+                      "MSVC x64 member-function hooking with hidden sret return type has incompatible RCX/RDX ABI; "
+                      "hook with an explicit free-function signature taking (C const*, R*, Args...) instead.");
         using Type = R(C const*, Args...);
     };
 
     template <typename R, typename C, typename... Args>
     struct MemberToFreeSig<R (C::*)(Args...) noexcept> {
+        static_assert(IsSafeMemberFreeReturn<R>,
+                      "MSVC x64 member-function hooking with hidden sret return type has incompatible RCX/RDX ABI; "
+                      "hook with an explicit free-function signature taking (C*, R*, Args...) instead.");
         using Type = R(C*, Args...);
     };
 
     template <typename R, typename C, typename... Args>
     struct MemberToFreeSig<R (C::*)(Args...) const noexcept> {
+        static_assert(IsSafeMemberFreeReturn<R>,
+                      "MSVC x64 member-function hooking with hidden sret return type has incompatible RCX/RDX ABI; "
+                      "hook with an explicit free-function signature taking (C const*, R*, Args...) instead.");
         using Type = R(C const*, Args...);
     };
 
@@ -291,7 +316,7 @@ namespace Detail {
         HookState& operator=(HookState const&) = delete;
 
         [[nodiscard]] auto original() const noexcept -> FnPtr {
-            return reinterpret_cast<FnPtr>(mOriginal);
+            return reinterpret_cast<FnPtr>(std::atomic_ref<void*>(mOriginal).load(std::memory_order_acquire));
         }
 
         [[nodiscard]] auto rawFunction() const noexcept -> FnPtr {
@@ -316,7 +341,7 @@ namespace Detail {
         virtual auto invoke(OriginalFunction<R(Args...)>& original, Args... args) -> R = 0;
 
     private:
-        void* mOriginal{};
+        alignas(std::atomic_ref<void*>::required_alignment) mutable void* mOriginal{};
         FnPtr mRawFunction{};
         int   mSlotIndex{-1};
     };
@@ -382,6 +407,12 @@ namespace Detail {
             const int ownDepth = tlsDepth()[index];
             while (mInFlight[index].load(std::memory_order_acquire) > ownDepth) {
                 std::this_thread::yield();
+            }
+            if (ownDepth == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                while (mInFlight[index].load(std::memory_order_acquire) > 0) {
+                    std::this_thread::yield();
+                }
             }
         }
 
@@ -469,7 +500,11 @@ namespace Detail {
                 std::ptrdiff_t adj;
             };
             auto repr = std::bit_cast<Repr>(fn);
+#if defined(CloverNT_ARCH_ARM64) && !defined(CloverNT_SYSTEM_WINDOWS)
+            return (repr.adj & 1) != 0 ? Address{} : static_cast<Address>(repr.ptr);
+#else
             return (repr.ptr & 1U) != 0 ? Address{} : static_cast<Address>(repr.ptr);
+#endif
         } else {
             static_assert(sizeof(MemFnPtr) == 0, "Unsupported member function pointer layout");
             return {};

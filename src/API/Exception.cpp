@@ -1,7 +1,11 @@
 #include <CloverNT/API/Exception.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <format>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -32,7 +36,7 @@ namespace {
         return "accessing";
     }
 
-    [[nodiscard]] std::string formatStructuredMessage(FaultKind                         kind,
+    [[nodiscard]] std::string formatStructuredMessage(const FaultKind                   kind,
                                                       const void*                       address,
                                                       const std::optional<FaultAccess>& access,
                                                       std::uint32_t                     nativeCode) {
@@ -51,7 +55,7 @@ namespace {
 
 } // namespace
 
-StackTrace StackTrace::fromAddresses(const void* const* addresses, std::size_t count) {
+StackTrace StackTrace::fromAddresses(const void* const* addresses, const std::size_t count) {
     StackTrace trace;
     if (addresses != nullptr && count > 0) {
         trace.mAddresses.assign(addresses, addresses + count);
@@ -59,7 +63,7 @@ StackTrace StackTrace::fromAddresses(const void* const* addresses, std::size_t c
     return trace;
 }
 
-std::string StackTrace::toString(std::size_t maxFrames) const {
+std::string StackTrace::toString(const std::size_t maxFrames) const {
     const auto resolved = frames();
     if (resolved.empty()) {
         return "<no stack trace>";
@@ -76,7 +80,7 @@ std::string StackTrace::toString(std::size_t maxFrames) const {
     return out;
 }
 
-Exception::Exception(std::string message, ErrorCategory category, const std::int32_t code)
+Exception::Exception(std::string message, const ErrorCategory category, const std::int32_t code)
     : mError(makeError(category, std::move(message), code)), mStackTrace(StackTrace::capture(1)) {}
 
 Exception::Exception(Error error) : mError(std::move(error)), mStackTrace(StackTrace::capture(1)) {}
@@ -196,7 +200,7 @@ void detail::throwStructured(const FaultRecord& record) {
     StackTrace                 trace = StackTrace::fromAddresses(record.frames, record.frameCount);
     std::optional<FaultAccess> access;
     if (record.hasAccess) {
-        access = FaultAccess{record.accessType, record.accessAddress};
+        access = FaultAccess{.type = record.accessType, .address = record.accessAddress};
     }
     throw StructuredException(record.kind, record.nativeCode, record.address, access, std::move(trace));
 }

@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <delayimp.h>
@@ -61,7 +63,7 @@ namespace {
     using SlowGetTaggedFn = void* (*) (void* self, int index, unsigned short tag);
     std::atomic<SlowGetTaggedFn> gSlowGetTagged{nullptr};
 
-    void* slowGetAlignedThunk(void* self, int index) { // old ABI: (this, index)
+    void* slowGetAlignedThunk(void* self, const int index) { // old ABI: (this, index)
         const auto fn = gSlowGetTagged.load(std::memory_order_acquire);
         return fn != nullptr ? fn(self, index, /*kEmbedderDataTypeTagDefault*/ 0) : nullptr;
     }
@@ -92,8 +94,7 @@ namespace {
 
     void recordMissing(const char* dll, const char* sym) {
         std::lock_guard lock(gMissingMutex);
-        std::string     entry = std::string(dll) + " : " + sym;
-        if (std::find(gMissing.begin(), gMissing.end(), entry) == gMissing.end()) {
+        if (std::string entry = std::string(dll) + " : " + sym; std::ranges::find(gMissing, entry) == gMissing.end()) {
             gMissing.push_back(std::move(entry));
         }
     }

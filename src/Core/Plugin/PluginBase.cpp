@@ -4,6 +4,9 @@
 #include <CloverNT/API/Logger.hpp>
 #include <CloverNT/API/Plugin/NativePlugin.hpp>
 
+#include <filesystem>
+#include <string_view>
+
 namespace CloverNT::Plugin {
 
 void PluginBase::bindSelf(NativePlugin& plugin) noexcept {

@@ -3,12 +3,16 @@
 #include <CloverNT/API/Memory/Memory.hpp>
 #include <CloverNT/Core/Modules/ModuleBase.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace CloverNT::Core::Modules {
 
@@ -59,7 +63,8 @@ private:
     [[nodiscard]] static auto resolveOwner(const std::weak_ptr<Plugin::Plugin>& owner) -> Expected<std::string>;
     [[nodiscard]] auto        addResource(std::unique_ptr<RuntimeResource> resource) -> Expected<Memory::ResourceId>;
     [[nodiscard]] auto        findResource(Memory::ResourceId id) -> RuntimeResource*;
-    [[nodiscard]] auto        removeResourceLocked(Memory::ResourceId id) -> Expected<void>;
+    [[nodiscard]] auto        detachResourceLocked(Memory::ResourceId id)
+            -> Expected<std::shared_ptr<Memory::Detail::ResourcePayload>>;
 
     mutable std::recursive_mutex                                     mMutex;
     std::map<Memory::ResourceId, std::unique_ptr<RuntimeResource>>   mResources;

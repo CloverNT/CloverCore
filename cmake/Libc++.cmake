@@ -7,11 +7,25 @@ function(_libcxx_query_github_release repo version arch abi_ns out_url out_tag)
         set(_api "https://api.github.com/repos/${repo}/releases/tags/${version}")
     endif ()
 
+    set(_libcxx_token "")
+    if (DEFINED LIBCXX_GITHUB_TOKEN AND NOT "${LIBCXX_GITHUB_TOKEN}" STREQUAL "")
+        set(_libcxx_token "${LIBCXX_GITHUB_TOKEN}")
+    elseif (DEFINED ENV{GITHUB_TOKEN} AND NOT "$ENV{GITHUB_TOKEN}" STREQUAL "")
+        set(_libcxx_token "$ENV{GITHUB_TOKEN}")
+    elseif (DEFINED ENV{GH_TOKEN} AND NOT "$ENV{GH_TOKEN}" STREQUAL "")
+        set(_libcxx_token "$ENV{GH_TOKEN}")
+    endif ()
+
+    set(_libcxx_headers HTTPHEADER "Accept: application/vnd.github.v3+json")
+    if (_libcxx_token)
+        list(APPEND _libcxx_headers HTTPHEADER "Authorization: Bearer ${_libcxx_token}")
+    endif ()
+
     set(_json_file "${LIBCXX_DOWNLOAD_DIR}/_release_info.json")
     file(DOWNLOAD "${_api}" "${_json_file}"
             STATUS _st
             TLS_VERIFY ON
-            HTTPHEADER "Accept: application/vnd.github.v3+json"
+            ${_libcxx_headers}
     )
     list(GET _st 0 _code)
     if (NOT _code EQUAL 0)

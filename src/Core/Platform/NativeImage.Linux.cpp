@@ -1,5 +1,8 @@
 #include <CloverNT/Core/Platform/NativeImage.hpp>
 
+#include <filesystem>
+#include <string_view>
+
 namespace CloverNT::Core::Platform {
 
 auto loadNativeImage(Utils::DynamicLibrary& library,

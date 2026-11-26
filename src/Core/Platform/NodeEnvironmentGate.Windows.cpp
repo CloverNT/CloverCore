@@ -1,6 +1,6 @@
-#include <CloverNT/API/Events/DllEvent.hpp>
+#include <CloverNT/API/Events/BuiltInEvents.hpp>
 #include <CloverNT/API/Events/EventBus.hpp>
-#include <CloverNT/API/Events/Listener.hpp>
+#include <CloverNT/API/Events/Subscription.hpp>
 #include <CloverNT/API/Exception.hpp>
 #include <CloverNT/API/Logger.hpp>
 #include <CloverNT/API/Memory/Hook.hpp>
@@ -8,7 +8,9 @@
 #include <CloverNT/Core/Platform/DelayLoadCompat.hpp>
 #include <CloverNT/Core/Platform/NodeEnvironmentGate.hpp>
 
-#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,7 +40,7 @@ namespace {
 
     [[nodiscard]] bool bindDelayImports(const char* moduleName) {
         const HRESULT hr = __HrLoadAllImportsForDll(moduleName);
-        failFastOnMissingDelayImports(moduleName); // logs all missing + exits if any remain
+        failFastOnMissingDelayImports(moduleName);
         return SUCCEEDED(hr);
     }
 
@@ -51,6 +53,11 @@ namespace {
                 const auto* code = reinterpret_cast<const std::uint8_t*>(importTarget);
                 if (code == nullptr) {
                     return importTarget;
+                }
+                if (code[0] == 0xE9) {
+                    std::int32_t rel = 0;
+                    std::memcpy(&rel, code + 1, sizeof(rel));
+                    code = code + 5 + rel;
                 }
                 if (code[0] == 0xFF && code[1] == 0x25) {
                     std::int32_t displacement = 0;
@@ -80,33 +87,32 @@ namespace {
 } // namespace
 
 struct NodeEnvironmentGate::Impl {
-    explicit Impl(NodeEnvironmentGate& gate) : mGate(gate) {
-        sActive.store(this, std::memory_order_release);
+    explicit Impl(std::shared_ptr<State> state) : mState(std::move(state)) {
+        std::lock_guard lock(sActiveMutex);
+        sActiveState = mState;
     }
 
     ~Impl() {
-        auto expected = this;
-        sActive.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+        clearActive();
     }
 
     Impl(Impl const&)            = delete;
     Impl& operator=(Impl const&) = delete;
 
     void arm() {
-        if (!mDllListener) {
-            auto listener = Event::EventBus::getInstance().emplaceListener<Event::DllLoadEvent>(
-                    [this](const Event::DllLoadEvent& event) {
-                        if (event.baseName() == "QQNT.dll") {
+        if (!mDllSub) {
+            auto sub = CloverNT::Event::EventBus::on<CloverNT::Event::Events::DllLoad>(
+                    [this](const CloverNT::Event::DllLoadInfo& info) {
+                        if (_stricmp(info.baseName.c_str(), "QQNT.dll") == 0) {
                             installHook();
                         }
                     },
-                    Event::EventPriority::High,
-                    Plugin::PluginManager::getPlugin("CloverCore"));
-            if (listener) {
-                mDllListener = listener.value();
+                    CloverNT::Event::EventPriority::High,
+                    "CloverCore");
+            if (sub) {
+                mDllSub = std::move(*sub);
             } else {
-                logger().error("NodeEnvironmentGate: failed to subscribe to DllLoadEvent: {}",
-                               listener.error().message);
+                logger().error("NodeEnvironmentGate: failed to subscribe to DllLoad: {}", sub.error().message);
             }
         }
         if (isModuleLoaded(L"QQNT.dll")) {
@@ -115,14 +121,19 @@ struct NodeEnvironmentGate::Impl {
     }
 
     void disarm() {
-        if (mDllListener) {
-            (void) Event::EventBus::removeListener(mDllListener);
-            mDllListener.reset();
-        }
+        clearActive();
+        mDllSub.unsubscribe();
         removeHooks();
     }
 
 private:
+    void clearActive() {
+        std::lock_guard lock(sActiveMutex);
+        if (const auto current = sActiveState.lock(); current == mState) {
+            sActiveState.reset();
+        }
+    }
+
     void installHook() {
         std::lock_guard lock(mHookMutex);
         if (mHookInstalled) {
@@ -169,8 +180,13 @@ private:
         return [preload = std::move(preload)](
                        node::Environment* e, const v8::Local<v8::Value> process, const v8::Local<v8::Value> require) {
             try {
-                if (const Impl* const active = sActive.load(std::memory_order_acquire); active != nullptr) {
-                    active->mGate.onPreload(e, process, require);
+                std::shared_ptr<State> state;
+                {
+                    std::lock_guard lock(sActiveMutex);
+                    state = sActiveState.lock();
+                }
+                if (state) {
+                    onPreloadState(state, e, process, require);
                 }
                 if (preload) {
                     preload(e, process, require);
@@ -185,9 +201,9 @@ private:
     }
 
     static auto detourLoadEnvExec(const Memory::Hook::OriginalFunction<ExecSig>& original,
-                                            node::Environment*                             env,
-                                            node::StartExecutionCallback                   cb,
-                                            node::EmbedderPreloadCallback preload) -> v8::MaybeLocal<v8::Value> {
+                                  node::Environment*                             env,
+                                  node::StartExecutionCallback                   cb,
+                                  node::EmbedderPreloadCallback                  preload) -> v8::MaybeLocal<v8::Value> {
         try {
             return original(env, std::move(cb), wrapPreload(std::move(preload)));
         } catch (const std::exception& exception) {
@@ -200,9 +216,9 @@ private:
     }
 
     static auto detourLoadEnvStr(const Memory::Hook::OriginalFunction<StrSig>& original,
-                                           node::Environment*                            env,
-                                           const std::string_view                        source,
-                                           node::EmbedderPreloadCallback preload) -> v8::MaybeLocal<v8::Value> {
+                                 node::Environment*                            env,
+                                 const std::string_view                        source,
+                                 node::EmbedderPreloadCallback                 preload) -> v8::MaybeLocal<v8::Value> {
         try {
             return original(env, source, wrapPreload(std::move(preload)));
         } catch (const std::exception& exception) {
@@ -214,20 +230,22 @@ private:
         return v8::MaybeLocal<v8::Value>{};
     }
 
-    NodeEnvironmentGate& mGate;
-    Event::ListenerPtr   mDllListener;
+    std::shared_ptr<State>              mState;
+    CloverNT::Event::ScopedSubscription mDllSub;
 
     std::mutex                                         mHookMutex;
     std::optional<Memory::Hook::InlineHandle<ExecSig>> mExecHook;
     std::optional<Memory::Hook::InlineHandle<StrSig>>  mStrHook;
     bool                                               mHookInstalled{};
 
-    static std::atomic<Impl*> sActive;
+    static std::mutex           sActiveMutex;
+    static std::weak_ptr<State> sActiveState;
 };
 
-std::atomic<NodeEnvironmentGate::Impl*> NodeEnvironmentGate::Impl::sActive{nullptr};
+std::mutex                                NodeEnvironmentGate::Impl::sActiveMutex;
+std::weak_ptr<NodeEnvironmentGate::State> NodeEnvironmentGate::Impl::sActiveState;
 
-NodeEnvironmentGate::NodeEnvironmentGate(Callbacks callbacks) : mCallbacks(std::move(callbacks)) {}
+NodeEnvironmentGate::NodeEnvironmentGate(Callbacks callbacks) : mState(createState(std::move(callbacks))) {}
 
 NodeEnvironmentGate::~NodeEnvironmentGate() {
     disarm();
@@ -235,7 +253,7 @@ NodeEnvironmentGate::~NodeEnvironmentGate() {
 
 void NodeEnvironmentGate::arm() {
     if (!mImpl) {
-        mImpl = std::make_unique<Impl>(*this);
+        mImpl = std::make_unique<Impl>(mState);
     }
     mImpl->arm();
 }

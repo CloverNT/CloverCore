@@ -6,11 +6,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <expected>
+#include <filesystem>
 #include <fstream>
+#include <ios>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include <Windows.h>
@@ -23,9 +29,10 @@ namespace {
         return *instance;
     }
 
-    [[nodiscard]] auto imageError(std::string message, const CommonErrorCode code = CommonErrorCode::OperationFailed)
+    [[nodiscard]] auto imageError(const std::string&    message,
+                                  const CommonErrorCode code = CommonErrorCode::OperationFailed)
             -> std::unexpected<Error> {
-        return unexpected(makeError(ErrorCategory::Plugin, code, std::move(message)));
+        return unexpected(makeError(ErrorCategory::Plugin, code, message));
     }
 
     [[nodiscard]] bool ownedByRunningProcess(std::filesystem::path const& directory) {
@@ -37,7 +44,7 @@ namespace {
         }
         const auto process = OpenProcess(SYNCHRONIZE, FALSE, pid);
         if (process == nullptr) {
-            return false;
+            return GetLastError() == ERROR_ACCESS_DENIED;
         }
         const bool running = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
         CloseHandle(process);
@@ -74,9 +81,13 @@ namespace {
         if (!in) {
             return imageError("cannot open " + path.string(), CommonErrorCode::NotFound);
         }
-        std::vector<char> bytes((in.tellg()));
+        const auto endPos = in.tellg();
+        if (endPos < 0) {
+            return imageError("cannot determine size of " + path.string());
+        }
+        std::vector<char> bytes(endPos);
         in.seekg(0);
-        if (!in.read(bytes.data(), static_cast<std::streamsize>(bytes.size()))) {
+        if (!bytes.empty() && !in.read(bytes.data(), static_cast<std::streamsize>(bytes.size()))) {
             return imageError("cannot read " + path.string());
         }
         return bytes;
@@ -147,8 +158,8 @@ namespace {
     [[nodiscard]] auto preloadSiblings(std::vector<std::string> const& imports,
                                        std::filesystem::path const&    entryDirectory,
                                        std::filesystem::path const&    pluginDirectory)
-            -> Expected<std::vector<CloverNT::Utils::DynamicLibrary>> {
-        std::vector<CloverNT::Utils::DynamicLibrary> loaded;
+            -> Expected<std::vector<Utils::DynamicLibrary>> {
+        std::vector<Utils::DynamicLibrary> loaded;
         for (auto const& name: imports) {
             const auto file = std::filesystem::path(name);
             if (GetModuleHandleW(file.c_str()) != nullptr) {
@@ -169,10 +180,10 @@ namespace {
 
 } // namespace
 
-auto loadNativeImage(Utils::DynamicLibrary& library,
-                     const std::string_view           pluginName,
-                     std::filesystem::path const&     entryPath,
-                     std::filesystem::path const&     pluginDirectory) -> Expected<std::filesystem::path> {
+auto loadNativeImage(Utils::DynamicLibrary&       library,
+                     const std::string_view       pluginName,
+                     std::filesystem::path const& entryPath,
+                     std::filesystem::path const& pluginDirectory) -> Expected<std::filesystem::path> {
     auto root = imageRoot();
     if (!root) {
         return unexpected(root.error());
@@ -199,8 +210,7 @@ auto loadNativeImage(Utils::DynamicLibrary& library,
     if (auto written = writeImage(image, *bytes); !written) {
         return fail(written.error());
     }
-    auto siblings = preloadSiblings(importedModules(*bytes), entryPath.parent_path(), pluginDirectory);
-    if (!siblings) {
+    if (auto siblings = preloadSiblings(importedModules(*bytes), entryPath.parent_path(), pluginDirectory); !siblings) {
         return fail(siblings.error());
     }
     if (auto loaded = library.load(image, pluginDirectory); !loaded) {

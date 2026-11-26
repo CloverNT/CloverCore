@@ -3,7 +3,14 @@
 #include <CloverNT/Core/Modules/HookRuntime.hpp>
 #include <CloverNT/Core/Modules/Manager.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <Mortis/MemoryScanner.hpp>
 #include <Mortis/Process.hpp>

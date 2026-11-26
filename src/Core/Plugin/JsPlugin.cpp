@@ -1,5 +1,7 @@
 #include <CloverNT/API/Plugin/JsPlugin.hpp>
 
+#include <filesystem>
+#include <optional>
 #include <utility>
 
 namespace CloverNT::Plugin {

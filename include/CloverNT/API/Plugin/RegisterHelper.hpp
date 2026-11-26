@@ -57,7 +57,9 @@ bool invokeUnload(T& plugin) {
         [[maybe_unused]] bool clovernt_plugin_unload_thunk() {                                                         \
             auto&      instance = clovernt_plugin_instance();                                                          \
             const bool ok       = ::CloverNT::Plugin::Detail::invokeUnload(instance);                                  \
-            ::CloverNT::Plugin::Detail::unbindPlugin(instance);                                                        \
+            if (ok) {                                                                                                  \
+                ::CloverNT::Plugin::Detail::unbindPlugin(instance);                                                    \
+            }                                                                                                          \
             return ok;                                                                                                 \
         }                                                                                                              \
     }                                                                                                                  \

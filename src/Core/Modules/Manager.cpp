@@ -2,9 +2,16 @@
 #include <CloverNT/API/Logger.hpp>
 #include <CloverNT/Core/Modules/Manager.hpp>
 
-#include <algorithm>
-#include <exception>
+#include <format>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <ranges>
+#include <string>
+#include <string_view>
+#include <typeindex>
+#include <utility>
+#include <vector>
 
 namespace CloverNT::Core::Modules {
 namespace {
@@ -45,6 +52,10 @@ Manager& Manager::getInstance() {
 
 auto Manager::initialize() -> Expected<bool> {
     std::lock_guard lock(mMutex);
+    if (mDestroying) {
+        return unexpected(
+                ErrorCategory::Module, CommonErrorCode::InvalidState, "Module manager is currently destroying");
+    }
     if (mInitialized && !mDestroyed) {
         return false;
     }
@@ -62,9 +73,10 @@ auto Manager::destroy() -> Expected<void> {
     std::vector<std::shared_ptr<ModuleInfoBase>> unloadOrder;
     {
         std::lock_guard lock(mMutex);
-        if (!mInitialized || mDestroyed) {
+        if (!mInitialized || mDestroyed || mDestroying) {
             return {};
         }
+        mDestroying = true;
 
         unloadOrder.reserve(mModuleOrder.size());
         for (auto& it: std::views::reverse(mModuleOrder)) {
@@ -83,15 +95,18 @@ auto Manager::destroy() -> Expected<void> {
         }
     }
 
+    {
+        std::lock_guard lock(mMutex);
+        mModules.clear();
+        mModuleNameMap.clear();
+        mModuleOrder.clear();
+        mDestroyed  = true;
+        mDestroying = false;
+    }
+
     if (!errors.empty()) {
         return aggregateModuleErrors("destroy", errors);
     }
-
-    std::lock_guard lock(mMutex);
-    mModules.clear();
-    mModuleNameMap.clear();
-    mModuleOrder.clear();
-    mDestroyed = true;
     return {};
 }
 

@@ -1,140 +1,476 @@
+#include <CloverNT/API/Events/EventBus.hpp>
 #include <CloverNT/API/Exception.hpp>
 #include <CloverNT/API/Logger.hpp>
 #include <CloverNT/API/Plugin/PluginManager.hpp>
+#include <CloverNT/API/Reflect/BridgeValue.hpp>
+#include <CloverNT/API/Reflect/Class.hpp>
 #include <CloverNT/Core/Modules/EventRuntime.hpp>
 #include <CloverNT/Core/Modules/Manager.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <ranges>
+#include <shared_mutex>
+#include <span>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <variant>
+#include <vector>
 
-namespace CloverNT::Core::Modules {
 namespace {
 
-    thread_local std::map<std::string, std::size_t, std::less<>> tActiveListenerPlugins;
+thread_local std::string_view                                tScopedOwnerPlugin{};
+thread_local std::map<std::string, std::size_t, std::less<>> tActiveDispatchPlugins;
 
-    Logger& logger() {
-        static auto instance = LoggerRegistry::getInstance().getOrCreate("CloverCore");
-        return *instance;
-    }
+auto coreLogger() -> CloverNT::Logger& {
+    static auto instance = CloverNT::LoggerRegistry::getInstance().getOrCreate("CloverCore");
+    return *instance;
+}
 
-    void appendError(std::string& errors, const std::string& message) {
-        if (!errors.empty()) {
-            errors += '\n';
+class ThreadDispatchPluginScope final {
+public:
+    explicit ThreadDispatchPluginScope(std::string pluginName) : mPluginName(std::move(pluginName)) {
+        if (!mPluginName.empty()) {
+            ++tActiveDispatchPlugins[mPluginName];
         }
-        errors += message;
     }
 
-    [[nodiscard]] constexpr auto dispatchRank(const Event::EventPriority priority) noexcept -> int {
-        return priority == Event::EventPriority::Monitor ? -1 : static_cast<int>(priority);
-    }
+    ThreadDispatchPluginScope(const ThreadDispatchPluginScope&)            = delete;
+    ThreadDispatchPluginScope& operator=(const ThreadDispatchPluginScope&) = delete;
 
-    class ThreadActivePluginScope {
-    public:
-        explicit ThreadActivePluginScope(std::string pluginName) : mPluginName(std::move(pluginName)) {
-            if (!mPluginName.empty()) {
-                ++tActiveListenerPlugins[mPluginName];
+    ~ThreadDispatchPluginScope() {
+        if (mPluginName.empty()) {
+            return;
+        }
+        if (const auto it = tActiveDispatchPlugins.find(mPluginName); it != tActiveDispatchPlugins.end()) {
+            if (--it->second == 0) {
+                tActiveDispatchPlugins.erase(it);
             }
         }
-
-        ThreadActivePluginScope(ThreadActivePluginScope const&)            = delete;
-        ThreadActivePluginScope& operator=(ThreadActivePluginScope const&) = delete;
-
-        ~ThreadActivePluginScope() {
-            if (mPluginName.empty()) {
-                return;
-            }
-            if (const auto it = tActiveListenerPlugins.find(mPluginName); it != tActiveListenerPlugins.end()) {
-                if (--it->second == 0) {
-                    tActiveListenerPlugins.erase(it);
-                }
-            }
-        }
-
-    private:
-        std::string mPluginName;
-    };
-
-} // namespace
-
-EventRuntime::ListenerActivity::ListenerActivity(EventRuntime& bus, std::string pluginName) noexcept
-    : mBus(&bus), mPluginName(std::move(pluginName)) {}
-
-EventRuntime::ListenerActivity::ListenerActivity(ListenerActivity&& other) noexcept
-    : mBus(std::exchange(other.mBus, nullptr)), mPluginName(std::move(other.mPluginName)) {}
-
-auto EventRuntime::ListenerActivity::operator=(ListenerActivity&& other) noexcept -> ListenerActivity& {
-    if (this != &other) {
-        reset();
-        mBus        = std::exchange(other.mBus, nullptr);
-        mPluginName = std::move(other.mPluginName);
     }
-    return *this;
+
+private:
+    std::string mPluginName;
+};
+
+[[nodiscard]] constexpr auto priorityRank(const CloverNT::Event::EventPriority priority) noexcept -> int {
+    return priority == CloverNT::Event::EventPriority::Monitor ? -1 : static_cast<int>(priority);
 }
 
-EventRuntime::ListenerActivity::~ListenerActivity() {
-    reset();
-}
-
-auto EventRuntime::ListenerActivity::pluginName() const noexcept -> std::string const& {
-    return mPluginName;
-}
-
-void EventRuntime::ListenerActivity::reset() noexcept {
-    auto* bus = std::exchange(mBus, nullptr);
-    if (bus == nullptr) {
-        return;
-    }
-    try {
-        bus->finishListenerActivity(mPluginName);
-    } catch (...) {}
-}
-
-bool EventRuntime::ListenerComparator::operator()(Event::ListenerPtr const& lhs, Event::ListenerPtr const& rhs) const {
-    if (const auto lhsRank = dispatchRank(lhs->priority()), rhsRank = dispatchRank(rhs->priority());
-        lhsRank != rhsRank) {
+[[nodiscard]] bool slotPrecedes(const CloverNT::Event::ListenerSlotPtr& lhs,
+                                const CloverNT::Event::ListenerSlotPtr& rhs) noexcept {
+    const int lhsRank = priorityRank(lhs->priority());
+    const int rhsRank = priorityRank(rhs->priority());
+    if (lhsRank != rhsRank) {
         return lhsRank > rhsRank;
     }
     return lhs->id() < rhs->id();
 }
+
+class ReflectPluginRegistry final {
+public:
+    static auto instance() -> ReflectPluginRegistry& {
+        static auto* const reg = new ReflectPluginRegistry();
+        return *reg;
+    }
+
+    auto acquireActivity(const std::string_view pluginName) -> std::shared_ptr<CloverNT::Reflect::PluginActivity> {
+        const std::string key = pluginName.empty() ? "CloverCore" : std::string(pluginName);
+        std::lock_guard   lock(mMutex);
+        auto& [activity, cells] = mEntries[key];
+        if (!activity) {
+            activity = std::make_shared<CloverNT::Reflect::PluginActivity>(key);
+        }
+        return activity;
+    }
+
+    void registerCell(const std::string_view pluginName, std::weak_ptr<CloverNT::Reflect::RevocableObjectCell> cell) {
+        const std::string key = pluginName.empty() ? "CloverCore" : std::string(pluginName);
+        std::lock_guard   lock(mMutex);
+        auto& [activity, cells] = mEntries[key];
+        if (!activity) {
+            activity = std::make_shared<CloverNT::Reflect::PluginActivity>(key);
+        }
+        if (cells.size() >= 64) {
+            std::erase_if(cells, [](const auto& w) { return w.expired(); });
+        }
+        cells.push_back(std::move(cell));
+    }
+
+    void beginClose(const std::string_view pluginName) {
+        std::shared_ptr<CloverNT::Reflect::PluginActivity> activity;
+        {
+            std::lock_guard lock(mMutex);
+            if (const auto it = mEntries.find(pluginName); it != mEntries.end()) {
+                activity = it->second.activity;
+            }
+        }
+        if (activity) {
+            activity->beginClose();
+        }
+    }
+
+    [[nodiscard]] bool waitIdleAndRevoke(const std::string_view pluginName, const std::uint32_t timeoutMs) {
+        std::shared_ptr<CloverNT::Reflect::PluginActivity>                 activity;
+        std::vector<std::weak_ptr<CloverNT::Reflect::RevocableObjectCell>> cells;
+        {
+            std::lock_guard lock(mMutex);
+            const auto      it = mEntries.find(pluginName);
+            if (it == mEntries.end()) {
+                return true;
+            }
+            activity = it->second.activity;
+        }
+        if (activity) {
+            activity->beginClose();
+            if (!activity->waitIdleFor(timeoutMs)) {
+                return false;
+            }
+        }
+        {
+            std::lock_guard lock(mMutex);
+            if (const auto it = mEntries.find(pluginName); it != mEntries.end()) {
+                cells.swap(it->second.cells);
+            }
+        }
+        for (const auto& weakCell: cells) {
+            if (const auto cell = weakCell.lock()) {
+                cell->revoke();
+            }
+        }
+        if (activity) {
+            activity->reopen();
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool closeAndDrainAll(const std::uint32_t timeoutMs, std::string& stuckOut) {
+        std::vector<std::pair<std::string, std::shared_ptr<CloverNT::Reflect::PluginActivity>>> activities;
+        std::vector<std::weak_ptr<CloverNT::Reflect::RevocableObjectCell>>                      allCells;
+        {
+            std::lock_guard lock(mMutex);
+            for (auto& [name, entry]: mEntries) {
+                if (entry.activity) {
+                    entry.activity->beginClose();
+                    activities.emplace_back(name, entry.activity);
+                }
+            }
+        }
+        bool allIdle = true;
+        for (const auto& [name, act]: activities) {
+            if (!act->waitIdleFor(timeoutMs)) {
+                allIdle = false;
+                if (!stuckOut.empty()) {
+                    stuckOut += ", ";
+                }
+                stuckOut += name;
+            }
+        }
+        if (allIdle) {
+            {
+                std::lock_guard lock(mMutex);
+                for (auto& [activity, cells]: mEntries | std::views::values) {
+                    for (auto& c: cells) {
+                        allCells.push_back(std::move(c));
+                    }
+                    cells.clear();
+                }
+            }
+            for (const auto& weakCell: allCells) {
+                if (auto cell = weakCell.lock()) {
+                    cell->revoke();
+                }
+            }
+            for (const auto& act: activities | std::views::values) {
+                act->reopen();
+            }
+        }
+        return allIdle;
+    }
+
+private:
+    struct Entry {
+        std::shared_ptr<CloverNT::Reflect::PluginActivity>                 activity;
+        std::vector<std::weak_ptr<CloverNT::Reflect::RevocableObjectCell>> cells;
+    };
+
+    std::mutex                                mMutex;
+    std::map<std::string, Entry, std::less<>> mEntries;
+};
+
+} // namespace
+
+namespace CloverNT::Reflect {
+
+void PluginActivity::leave() noexcept {
+    if (const auto prev = mInFlight.fetch_sub(1, std::memory_order_seq_cst);
+        prev == 1 && mWaiters.load(std::memory_order_seq_cst) > 0) {
+        std::lock_guard lock(mWaitMutex);
+        mWaitCv.notify_all();
+    }
+}
+
+bool PluginActivity::waitIdleFor(const std::uint32_t timeoutMs) {
+    if (mInFlight.load(std::memory_order_acquire) == 0) {
+        return true;
+    }
+    mWaiters.fetch_add(1, std::memory_order_seq_cst);
+    bool idle = false;
+    {
+        std::unique_lock lock(mWaitMutex);
+        idle = mWaitCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] {
+            return mInFlight.load(std::memory_order_acquire) == 0;
+        });
+    }
+    mWaiters.fetch_sub(1, std::memory_order_seq_cst);
+    return idle;
+}
+
+void PluginActivity::waitIdle() {
+    if (mInFlight.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    mWaiters.fetch_add(1, std::memory_order_seq_cst);
+    {
+        std::unique_lock lock(mWaitMutex);
+        mWaitCv.wait(lock, [&] { return mInFlight.load(std::memory_order_acquire) == 0; });
+    }
+    mWaiters.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+RevocableObjectCell::RevocableObjectCell(std::shared_ptr<void>           instance,
+                                         void*                           rawPtr,
+                                         const ClassDescriptor*          descriptor,
+                                         const bool                      isConst,
+                                         std::string                     ownerPlugin,
+                                         std::shared_ptr<PluginActivity> activity,
+                                         std::string                     typeName)
+    : mDescriptor(descriptor),
+      mTypeName(!typeName.empty() ? std::move(typeName)
+                                  : (descriptor != nullptr ? std::string(descriptor->name) : std::string("Object"))),
+      mIdentityKey(rawPtr),
+      mIsConst(isConst),
+      mOwnerPlugin(std::move(ownerPlugin)),
+      mActivity(std::move(activity)),
+      mInstance(std::move(instance)),
+      mRawPtr(rawPtr) {}
+
+auto RevocableObjectCell::pin() const -> Expected<PinnedAccess> {
+    PluginActivity::Guard guard;
+    if (mActivity) {
+        guard = mActivity->tryEnter();
+        if (!guard) {
+            return bridgeUnexpected(BridgeErrorCode::ObjectRevoked,
+                                    "object '" + mTypeName + "' from plugin '" + mOwnerPlugin +
+                                            "' is no longer available");
+        }
+    }
+    std::shared_lock lock(mMutex);
+    if (mRevoked.load(std::memory_order_acquire) || !mInstance || mRawPtr == nullptr) {
+        return bridgeUnexpected(BridgeErrorCode::ObjectRevoked,
+                                "object '" + mTypeName + "' from plugin '" + mOwnerPlugin + "' is no longer available");
+    }
+    return PinnedAccess{
+            .guard    = std::move(guard),
+            .instance = mInstance,
+            .rawPtr   = mRawPtr,
+    };
+}
+
+auto RevocableObjectCell::shareRaw() const -> std::pair<std::shared_ptr<void>, void*> {
+    if (!alive()) {
+        return {nullptr, nullptr};
+    }
+    std::shared_lock lock(mMutex);
+    if (mRevoked.load(std::memory_order_acquire) || !mInstance || mRawPtr == nullptr) {
+        return {nullptr, nullptr};
+    }
+    return {mInstance, mRawPtr};
+}
+
+void RevocableObjectCell::revoke() noexcept {
+    if (mRevoked.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    mDescriptor.store(nullptr, std::memory_order_release);
+    std::shared_ptr<void> doomed;
+    {
+        std::unique_lock lock(mMutex);
+        doomed  = std::move(mInstance);
+        mRawPtr = nullptr;
+    }
+    doomed.reset();
+}
+
+void BridgeAsyncState::resolve(BridgeValue value) {
+    settle(Expected<BridgeValue>{std::move(value)});
+}
+
+void BridgeAsyncState::reject(Error error) {
+    settle(Expected<BridgeValue>{unexpected(error)});
+}
+
+void BridgeAsyncState::settle(Expected<BridgeValue> outcome) {
+    std::vector<Continuation> continuations;
+    {
+        std::lock_guard lock(mMutex);
+        if (mOutcome.has_value()) {
+            return;
+        }
+        mOutcome.emplace(std::move(outcome));
+        continuations.swap(mContinuations);
+    }
+    mCv.notify_all();
+    for (auto& cont: continuations) {
+        if (cont) {
+            try {
+                cont(*mOutcome);
+            } catch (...) {}
+        }
+    }
+}
+
+void BridgeAsyncState::then(Continuation continuation) {
+    if (!continuation) {
+        return;
+    }
+    std::optional<Expected<BridgeValue>> immediate;
+    {
+        std::lock_guard lock(mMutex);
+        if (mOutcome.has_value()) {
+            immediate = mOutcome;
+        } else {
+            mContinuations.push_back(std::move(continuation));
+            return;
+        }
+    }
+    try {
+        continuation(*immediate);
+    } catch (...) {}
+}
+
+bool BridgeAsyncState::ready() const {
+    std::lock_guard lock(mMutex);
+    return mOutcome.has_value();
+}
+
+auto BridgeAsyncState::wait() -> const Expected<BridgeValue>& {
+    std::unique_lock lock(mMutex);
+    mCv.wait(lock, [&] { return mOutcome.has_value(); });
+    return *mOutcome;
+}
+
+CoreBridgeCallable::CoreBridgeCallable(std::shared_ptr<RevocableObjectCell> cell, const InvokeFn invokeFn) noexcept
+    : mCell(std::move(cell)), mInvokeFn(invokeFn) {}
+
+auto CoreBridgeCallable::ownerPlugin() const noexcept -> std::string_view {
+    return mCell ? mCell->ownerPlugin() : std::string_view{"CloverCore"};
+}
+
+bool CoreBridgeCallable::alive() const noexcept {
+    return mCell && mCell->alive() && mInvokeFn != nullptr;
+}
+
+bool CoreBridgeCallable::canInvokeSyncHere() const noexcept {
+    return mInvokeFn != nullptr;
+}
+
+auto CoreBridgeCallable::invoke(const std::span<const BridgeValue> args) -> Expected<BridgeValue> {
+    if (!mCell || mInvokeFn == nullptr) {
+        return bridgeUnexpected(BridgeErrorCode::ObjectRevoked, "callback is no longer available");
+    }
+    auto pinned = mCell->pin();
+    if (!pinned) {
+        return unexpected(std::move(pinned).error());
+    }
+    ScopedOwnerPlugin         ownerScope(mCell->ownerPlugin());
+    ThreadDispatchPluginScope dispatchScope(std::string(mCell->ownerPlugin()));
+    return mInvokeFn(pinned->rawPtr, args);
+}
+
+auto CoreBridgeCallable::post(std::vector<BridgeValue> args) -> Expected<void> {
+    auto res = invoke(args);
+    if (!res) {
+        return unexpected(std::move(res).error());
+    }
+    return {};
+}
+
+auto CoreBridgeCallable::invokeAsync(std::vector<BridgeValue> args) -> BridgeAsync {
+    auto state = std::make_shared<BridgeAsyncState>();
+    auto res   = invoke(args);
+    if (!res) {
+        state->reject(std::move(res).error());
+    } else if (auto* nested = std::get_if<BridgeAsync>(&res->data); nested != nullptr && *nested) {
+        return *nested;
+    } else {
+        state->resolve(std::move(*res));
+    }
+    return state;
+}
+
+auto currentOwnerPluginName() -> std::string {
+    if (!tScopedOwnerPlugin.empty()) {
+        return std::string(tScopedOwnerPlugin);
+    }
+    if (const auto current = Plugin::PluginManager::currentPlugin(); current && !current->name().empty()) {
+        return std::string(current->name());
+    }
+    return "CloverCore";
+}
+
+auto acquirePluginActivity(const std::string_view pluginName) -> std::shared_ptr<PluginActivity> {
+    return ReflectPluginRegistry::instance().acquireActivity(pluginName);
+}
+
+void registerPluginObjectCell(const std::string_view pluginName, std::weak_ptr<RevocableObjectCell> cell) {
+    ReflectPluginRegistry::instance().registerCell(pluginName, std::move(cell));
+}
+
+ScopedOwnerPlugin::ScopedOwnerPlugin(const std::string_view pluginName) noexcept
+    : mPrevious(std::exchange(tScopedOwnerPlugin, pluginName)) {}
+
+ScopedOwnerPlugin::~ScopedOwnerPlugin() {
+    tScopedOwnerPlugin = mPrevious;
+}
+
+} // namespace CloverNT::Reflect
+
+namespace CloverNT::Core::Modules {
+
+namespace Event = CloverNT::Event;
 
 auto EventRuntime::onLoad() -> Expected<void> {
     return {};
 }
 
 auto EventRuntime::onUnload() -> Expected<void> {
-    if (!tActiveListenerPlugins.empty()) {
+    if (!tActiveDispatchPlugins.empty()) {
         return unexpected(ErrorCategory::Event,
                           CommonErrorCode::InvalidState,
-                          "Cannot unload EventRuntime from an active event listener callback");
+                          "cannot unload event system while an event listener is running");
     }
-
-    std::unique_lock lock(mMutex);
-    mPluginIdle.notify_all();
-    using namespace std::chrono_literals;
-    constexpr auto kDrainTimeout = 5s;
-    if (!mPluginIdle.wait_for(lock, kDrainTimeout, [&] { return mActivePluginListeners.empty(); })) {
-        std::string stuck;
-        for (const auto& name: mActivePluginListeners | std::views::keys) {
-            if (!stuck.empty()) {
-                stuck += ", ";
-            }
-            stuck += name;
-        }
-        logger().warn(
-                "EventRuntime unload: {} plugin(s) still have active listeners after {}ms; forcing teardown: [{}]",
-                mActivePluginListeners.size(),
-                std::chrono::duration_cast<std::chrono::milliseconds>(kDrainTimeout).count(),
-                stuck);
+    {
+        std::unique_lock lock(mMutex);
+        mChannels.clear();
+        mSlotTopics.clear();
     }
-    mEvents.clear();
-    mListeners.clear();
-    mListenerOwners.clear();
-    mPluginListeners.clear();
-    mPluginEvents.clear();
-    mPluginIdle.notify_all();
+    std::string stuck;
+    if (!ReflectPluginRegistry::instance().closeAndDrainAll(5000, stuck)) {
+        return unexpected(ErrorCategory::Event,
+                          CommonErrorCode::OperationFailed,
+                          "timed out waiting for active plugin callbacks to finish: " + stuck);
+    }
     return {};
 }
 
@@ -143,336 +479,315 @@ auto EventRuntime::onEnable() -> Expected<void> {
 }
 
 auto EventRuntime::onDisable() -> Expected<void> {
-    std::lock_guard lock(mMutex);
-    mPluginIdle.notify_all();
     return {};
 }
 
-auto EventRuntime::registerEvent(const std::string_view eventName, const std::weak_ptr<Plugin::Plugin>& owner)
-        -> Expected<void> {
-    if (eventName.empty()) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::InvalidArgument, "Event name is empty");
+auto EventRuntime::addSlot(const std::string_view topic, Event::ListenerSlotPtr slot)
+        -> Expected<Event::SubscriptionId> {
+    if (topic.empty()) {
+        return unexpected(ErrorCategory::Event, CommonErrorCode::InvalidArgument, "event topic cannot be empty");
+    }
+    if (!slot || slot->id() == Event::kInvalidSubscriptionId) {
+        return unexpected(ErrorCategory::Event, CommonErrorCode::InvalidArgument, "event listener is invalid");
     }
 
-    auto plugin = owner.lock();
-    if (!plugin) {
-        plugin = Plugin::PluginManager::currentPlugin();
-    }
-    if (!plugin) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::InvalidState, "No current plugin is available");
-    }
-
-    std::lock_guard lock(mMutex);
+    std::unique_lock lock(mMutex);
     if (!isEnabled()) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::Inactive, "Event bus is inactive");
+        return unexpected(ErrorCategory::Event, CommonErrorCode::Inactive, "event system is not active");
     }
-    auto [it, inserted] = mEvents.try_emplace(std::string(eventName));
-    if (!inserted) {
-        return unexpected(ErrorCategory::Event,
-                          CommonErrorCode::AlreadyExists,
-                          "Event is already registered: " + std::string(eventName));
-    }
-    it->second.owner = std::string(plugin->name());
-    mPluginEvents[it->second.owner].emplace(it->first);
-    return {};
-}
-
-auto EventRuntime::addListener(Event::ListenerPtr const& listener, const std::string_view eventName) -> Expected<void> {
-    if (!listener || eventName.empty()) {
-        return unexpected(
-                ErrorCategory::Event, CommonErrorCode::InvalidArgument, "Listener and event name are required");
+    if (mSlotTopics.contains(slot->id())) {
+        return unexpected(ErrorCategory::Event, CommonErrorCode::AlreadyExists, "duplicate subscription id");
     }
 
-    auto owner = listener->owner().lock();
-    if (!owner) {
-        owner = Plugin::PluginManager::currentPlugin();
-    }
-    if (!owner) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::InvalidState, "No current plugin is available");
-    }
-
-    std::lock_guard lock(mMutex);
-    if (!isEnabled()) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::Inactive, "Event bus is inactive");
-    }
-    const auto listenerId = listener->id();
-    if (mListeners.contains(listenerId)) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::AlreadyExists, "Listener id is already registered");
-    }
-
-    if (!mEvents.contains(eventName)) {
-        if (auto [it, inserted] = mEvents.try_emplace(std::string(eventName)); inserted) {
-            it->second.owner = std::string(owner->name());
-            mPluginEvents[it->second.owner].emplace(it->first);
-        }
-    }
-
-    auto& listeners = mEvents[std::string(eventName)].listeners;
-    if (auto [_, inserted] = listeners.emplace(listener); !inserted) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::AlreadyExists, "Listener is already registered");
-    }
-
-    if (auto [_, inserted] = mListeners.emplace(listenerId, listener); !inserted) {
-        listeners.erase(listener);
-        return unexpected(ErrorCategory::Event, CommonErrorCode::AlreadyExists, "Listener id is already registered");
-    }
-    const auto ownerName = std::string(owner->name());
-    mListenerOwners.emplace(listenerId, ownerName);
-    mPluginListeners[ownerName].emplace(listenerId);
-    return {};
-}
-
-auto EventRuntime::removeListener(Event::ListenerPtr const& listener) -> Expected<void> {
-    if (!listener) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::InvalidArgument, "Listener is null");
-    }
-    return removeListener(listener->id());
-}
-
-auto EventRuntime::removeListener(const Event::ListenerId id) -> Expected<void> {
-    std::lock_guard lock(mMutex);
-    const auto      listenerIt = mListeners.find(id);
-    if (listenerIt == mListeners.end()) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::NotFound, "Listener was not found");
-    }
-
-    const auto listener = listenerIt->second;
-    for (auto& [owner, listeners]: mEvents | std::views::values) {
-        listeners.erase(listener);
-    }
-    for (auto& listenerIds: mPluginListeners | std::views::values) {
-        listenerIds.erase(id);
-    }
-    mListeners.erase(listenerIt);
-    mListenerOwners.erase(id);
-    return {};
-}
-
-auto EventRuntime::getListener(const Event::ListenerId id) const -> Event::ListenerPtr {
-    std::lock_guard lock(mMutex);
-    const auto      it = mListeners.find(id);
-    return it == mListeners.end() ? nullptr : it->second;
-}
-
-bool EventRuntime::hasListener(const Event::ListenerId id) const {
-    std::lock_guard lock(mMutex);
-    return mListeners.contains(id);
-}
-
-auto EventRuntime::getListenerCount(const std::string_view eventName) const -> std::size_t {
-    std::lock_guard lock(mMutex);
-    if (eventName.empty()) {
-        return mListeners.size();
-    }
-    const auto it = mEvents.find(eventName);
-    return it == mEvents.end() ? 0 : it->second.listeners.size();
-}
-
-auto EventRuntime::events() const -> std::vector<std::string> {
-    std::lock_guard          lock(mMutex);
-    std::vector<std::string> result;
-    result.reserve(mEvents.size());
-    for (const auto& name: mEvents | std::views::keys) {
-        result.emplace_back(name);
-    }
-    return result;
-}
-
-void EventRuntime::finishListenerActivity(std::string const& pluginName) {
-    if (pluginName.empty()) {
-        return;
-    }
-
-    {
-        std::lock_guard lock(mMutex);
-        const auto      it = mActivePluginListeners.find(pluginName);
-        if (it == mActivePluginListeners.end()) {
-            return;
-        }
-        if (--it->second == 0) {
-            mActivePluginListeners.erase(it);
-        }
-    }
-    mPluginIdle.notify_all();
-}
-
-auto EventRuntime::beginListenerActivity(Event::ListenerPtr const& listener) -> std::optional<ListenerActivity> {
-    std::lock_guard lock(mMutex);
-    if (!isEnabled() || !listener) {
-        return std::nullopt;
-    }
-
-    if (const auto listenerIt = mListeners.find(listener->id());
-        listenerIt == mListeners.end() || listenerIt->second != listener) {
-        return std::nullopt;
-    }
-
-    std::string pluginName;
-    if (const auto ownerIt = mListenerOwners.find(listener->id()); ownerIt != mListenerOwners.end()) {
-        pluginName = ownerIt->second;
-    }
-    std::optional<ListenerActivity> activity(std::in_place, *this, std::move(pluginName));
-    if (!activity->pluginName().empty()) {
-        ++mActivePluginListeners[activity->pluginName()];
-    }
-    return activity;
-}
-
-void EventRuntime::publish(Event::Event& event, const std::string_view eventName) {
-    const auto* const cancellable = dynamic_cast<Event::Cancellable*>(&event);
-
-    std::vector<Event::ListenerPtr>    listeners;
-    std::map<std::string, std::size_t> publishHolds;
-    {
-        std::lock_guard lock(mMutex);
-        if (!isEnabled()) {
-            return;
-        }
-        const auto it = mEvents.find(eventName);
-        if (it == mEvents.end()) {
-            return;
-        }
-        listeners.reserve(it->second.listeners.size());
-        for (auto const& listener: it->second.listeners) {
-            listeners.emplace_back(listener);
-            if (const auto ownerIt = mListenerOwners.find(listener->id());
-                ownerIt != mListenerOwners.end() && !ownerIt->second.empty()) {
-                ++mActivePluginListeners[ownerIt->second];
-                ++publishHolds[ownerIt->second];
+    const auto id       = slot->id();
+    auto&      channel  = mChannels[std::string(topic)];
+    auto       nextList = std::make_shared<SlotList>();
+    if (channel.snapshot) {
+        nextList->reserve(channel.snapshot->size() + 1);
+        for (const auto& existing: *channel.snapshot) {
+            if (!existing->isConsumed()) {
+                nextList->push_back(existing);
             }
         }
     }
+    const auto insertPos = std::ranges::upper_bound(*nextList, slot, slotPrecedes);
+    nextList->insert(insertPos, std::move(slot));
+    channel.snapshot = std::move(nextList);
+    mSlotTopics.emplace(id, std::string(topic));
+    return id;
+}
 
-    auto releaseHolds = [this, &listeners, &publishHolds]() noexcept {
-        listeners.clear();
-        if (publishHolds.empty()) {
-            return;
+bool EventRuntime::removeSlot(const Event::SubscriptionId id) noexcept {
+    if (id == Event::kInvalidSubscriptionId) {
+        return false;
+    }
+    Event::ListenerSlotPtr removedSlot;
+    {
+        std::unique_lock lock(mMutex);
+        const auto       topicIt = mSlotTopics.find(id);
+        if (topicIt == mSlotTopics.end()) {
+            return false;
         }
-        {
-            std::lock_guard lock(mMutex);
-            for (auto const& [owner, count]: publishHolds) {
-                if (const auto activeIt = mActivePluginListeners.find(owner);
-                    activeIt != mActivePluginListeners.end()) {
-                    if (activeIt->second <= count) {
-                        mActivePluginListeners.erase(activeIt);
-                    } else {
-                        activeIt->second -= count;
+        const std::string topic = topicIt->second;
+        mSlotTopics.erase(topicIt);
+
+        if (const auto chanIt = mChannels.find(topic); chanIt != mChannels.end() && chanIt->second.snapshot) {
+            auto nextList = std::make_shared<SlotList>();
+            nextList->reserve(chanIt->second.snapshot->size());
+            for (const auto& slot: *chanIt->second.snapshot) {
+                if (slot->id() == id) {
+                    removedSlot = slot;
+                } else if (!slot->isConsumed()) {
+                    nextList->push_back(slot);
+                }
+            }
+            if (nextList->empty()) {
+                mChannels.erase(chanIt);
+            } else {
+                chanIt->second.snapshot = std::move(nextList);
+            }
+        }
+    }
+    removedSlot.reset();
+    return true;
+}
+
+bool EventRuntime::hasSubscription(const Event::SubscriptionId id) const noexcept {
+    if (id == Event::kInvalidSubscriptionId) {
+        return false;
+    }
+    std::shared_lock lock(mMutex);
+    const auto       topicIt = mSlotTopics.find(id);
+    if (topicIt == mSlotTopics.end()) {
+        return false;
+    }
+    if (const auto chanIt = mChannels.find(topicIt->second); chanIt != mChannels.end() && chanIt->second.snapshot) {
+        for (const auto& slot: *chanIt->second.snapshot) {
+            if (slot->id() == id) {
+                return !slot->isConsumed();
+            }
+        }
+    }
+    return false;
+}
+
+auto EventRuntime::listenerCount(const std::string_view topic) const noexcept -> std::size_t {
+    std::shared_lock lock(mMutex);
+    if (topic.empty()) {
+        std::size_t total = 0;
+        for (const auto& [snapshot]: mChannels | std::views::values) {
+            if (snapshot) {
+                for (const auto& slot: *snapshot) {
+                    if (!slot->isConsumed()) {
+                        ++total;
                     }
                 }
             }
         }
-        mPluginIdle.notify_all();
-    };
-    struct HoldGuard {
-        decltype(releaseHolds)& release;
-        ~HoldGuard() {
-            release();
+        return total;
+    }
+    if (const auto it = mChannels.find(topic); it != mChannels.end() && it->second.snapshot) {
+        std::size_t count = 0;
+        for (const auto& slot: *it->second.snapshot) {
+            if (!slot->isConsumed()) {
+                ++count;
+            }
         }
-    } holdGuard{releaseHolds};
+        return count;
+    }
+    return 0;
+}
 
-    for (auto const& listener: listeners) {
-        if (cancellable != nullptr && cancellable->isCancelled() &&
-            listener->priority() != Event::EventPriority::Monitor) {
-            continue;
-        }
-
-        std::optional<ListenerActivity> activity;
-        try {
-            activity = beginListenerActivity(listener);
-        } catch (std::exception const& exception) {
-            logger().error("Failed to begin event listener activity for {} while handling {}: {}",
-                           listener ? listener->id() : 0,
-                           std::string(eventName),
-                           exception.what());
-            continue;
-        } catch (...) {
-            logger().error("Failed to begin event listener activity for {} while handling {}: unknown exception",
-                           listener ? listener->id() : 0,
-                           std::string(eventName));
-            continue;
-        }
-
-        if (!activity) {
-            continue;
-        }
-
-        try {
-            ThreadActivePluginScope activePlugin(activity->pluginName());
-            listener->call(event);
-        } catch (std::exception const& exception) {
-            logger().error("Event listener {} failed while handling {}: {}",
-                           listener ? listener->id() : 0,
-                           std::string(eventName),
-                           exception.what());
-        } catch (...) {
-            logger().error("Event listener {} failed while handling {}: unknown exception",
-                           listener ? listener->id() : 0,
-                           std::string(eventName));
+auto EventRuntime::topics() const -> std::vector<std::string> {
+    std::shared_lock         lock(mMutex);
+    std::vector<std::string> names;
+    names.reserve(mChannels.size());
+    for (const auto& [name, chan]: mChannels) {
+        if (chan.snapshot && !chan.snapshot->empty()) {
+            names.push_back(name);
         }
     }
+    return names;
+}
+
+void EventRuntime::compactConsumedOnceSlots(const std::string_view topic) noexcept {
+    std::vector<Event::ListenerSlotPtr> doomed;
+    {
+        std::unique_lock lock(mMutex);
+        const auto       chanIt = mChannels.find(topic);
+        if (chanIt == mChannels.end() || !chanIt->second.snapshot) {
+            return;
+        }
+        bool anyConsumed = false;
+        for (const auto& slot: *chanIt->second.snapshot) {
+            if (slot->isConsumed()) {
+                anyConsumed = true;
+                break;
+            }
+        }
+        if (!anyConsumed) {
+            return;
+        }
+        auto nextList = std::make_shared<SlotList>();
+        nextList->reserve(chanIt->second.snapshot->size());
+        for (const auto& slot: *chanIt->second.snapshot) {
+            if (slot->isConsumed()) {
+                mSlotTopics.erase(slot->id());
+                doomed.push_back(slot);
+            } else {
+                nextList->push_back(slot);
+            }
+        }
+        if (nextList->empty()) {
+            mChannels.erase(chanIt);
+        } else {
+            chanIt->second.snapshot = std::move(nextList);
+        }
+    }
+    doomed.clear();
+}
+
+auto EventRuntime::dispatch(Event::EventInvocation& inv) -> Expected<bool> {
+    ImmutableSlotList                           snapshot;
+    std::vector<Reflect::PluginActivity::Guard> pinnedGuards;
+    {
+        std::shared_lock lock(mMutex);
+        if (!isEnabled()) {
+            return false;
+        }
+        const auto it = mChannels.find(inv.topic());
+        if (it == mChannels.end() || !it->second.snapshot || it->second.snapshot->empty()) {
+            return false;
+        }
+        snapshot = it->second.snapshot;
+        pinnedGuards.reserve(snapshot->size());
+        for (const auto& slot: *snapshot) {
+            if (slot->activity()) {
+                pinnedGuards.push_back(slot->activity()->tryEnter());
+            } else {
+                pinnedGuards.emplace_back();
+            }
+        }
+    }
+
+    struct SnapshotHoldCleanup {
+        ImmutableSlotList&                           snap;
+        std::vector<Reflect::PluginActivity::Guard>& guards;
+        ~SnapshotHoldCleanup() {
+            snap.reset();
+            guards.clear();
+        }
+    } holdCleanup{snapshot, pinnedGuards};
+
+    bool anyOnceConsumed = false;
+
+    for (std::size_t i = 0; i < snapshot->size(); ++i) {
+        const auto& slot = (*snapshot)[i];
+        if (slot->activity() && (!pinnedGuards[i] || slot->activity()->isClosing())) {
+            continue;
+        }
+        if (inv.isCancelled() && slot->priority() != Event::EventPriority::Monitor) {
+            continue;
+        }
+        if (!slot->tryConsumeOnce()) {
+            continue;
+        }
+        if (slot->isOnce()) {
+            anyOnceConsumed = true;
+        }
+
+        try {
+            Reflect::ScopedOwnerPlugin ownerScope(slot->ownerPlugin());
+            ThreadDispatchPluginScope  dispatchScope(std::string(slot->ownerPlugin()));
+            slot->dispatch(inv);
+        } catch (const Exception& ex) {
+            coreLogger().error("Event listener {} (owner '{}') faulted on '{}': {}",
+                               slot->id(),
+                               slot->ownerPlugin(),
+                               inv.topic(),
+                               ex.describe());
+        } catch (const std::exception& ex) {
+            coreLogger().error("Event listener {} (owner '{}') threw on '{}': {}",
+                               slot->id(),
+                               slot->ownerPlugin(),
+                               inv.topic(),
+                               normalizeErrorMessage(ex.what()));
+        } catch (...) {
+            coreLogger().error("Event listener {} (owner '{}') threw an unknown exception on '{}'",
+                               slot->id(),
+                               slot->ownerPlugin(),
+                               inv.topic());
+        }
+    }
+
+    if (anyOnceConsumed) {
+        compactConsumedOnceSlots(inv.topic());
+    }
+    return inv.isCancelled();
 }
 
 auto EventRuntime::clearPlugin(const std::string_view pluginName) -> Expected<void> {
-    std::lock_guard lock(mMutex);
-    const auto      name = std::string(pluginName);
-    std::string     errors;
-
-    if (const auto listenerIt = mPluginListeners.find(name); listenerIt != mPluginListeners.end()) {
-        for (const auto listenerIds = listenerIt->second; const auto id: listenerIds) {
-            if (auto removed = removeListener(id); !removed) {
-                appendError(errors, "Listener " + std::to_string(id) + ": " + removed.error().message);
-            }
-        }
-        mPluginListeners.erase(name);
+    if (pluginName.empty()) {
+        return {};
     }
+    ReflectPluginRegistry::instance().beginClose(pluginName);
 
-    if (const auto eventIt = mPluginEvents.find(name); eventIt != mPluginEvents.end()) {
-        for (auto const& eventName: eventIt->second) {
-            if (auto existing = mEvents.find(eventName); existing != mEvents.end()) {
-                for (auto const& listener: existing->second.listeners) {
-                    const auto listenerId = listener->id();
-                    if (mListeners.erase(listenerId) == 0) {
-                        appendError(errors,
-                                    "Listener " + std::to_string(listenerId) +
-                                            " was missing from the global index while clearing event " + eventName);
-                    }
-                    mListenerOwners.erase(listenerId);
-                    for (auto& listenerIds: mPluginListeners | std::views::values) {
-                        listenerIds.erase(listenerId);
-                    }
+    std::vector<Event::ListenerSlotPtr> removedSlots;
+    {
+        std::unique_lock lock(mMutex);
+        for (auto chanIt = mChannels.begin(); chanIt != mChannels.end();) {
+            const auto& snap = chanIt->second.snapshot;
+            if (!snap || snap->empty()) {
+                chanIt = mChannels.erase(chanIt);
+                continue;
+            }
+            bool matches = false;
+            for (const auto& slot: *snap) {
+                if (slot->ownerPlugin() == pluginName || slot->isConsumed()) {
+                    matches = true;
+                    break;
                 }
-                mEvents.erase(existing);
+            }
+            if (!matches) {
+                ++chanIt;
+                continue;
+            }
+            auto nextList = std::make_shared<SlotList>();
+            nextList->reserve(snap->size());
+            for (const auto& slot: *snap) {
+                if (slot->ownerPlugin() == pluginName || slot->isConsumed()) {
+                    mSlotTopics.erase(slot->id());
+                    removedSlots.push_back(slot);
+                } else {
+                    nextList->push_back(slot);
+                }
+            }
+            if (nextList->empty()) {
+                chanIt = mChannels.erase(chanIt);
+            } else {
+                chanIt->second.snapshot = std::move(nextList);
+                ++chanIt;
             }
         }
-        mPluginEvents.erase(eventIt);
     }
-
-    if (!errors.empty()) {
-        return unexpected(ErrorCategory::Event,
-                          CommonErrorCode::OperationFailed,
-                          "Failed to clear one or more plugin listeners for " + name + ":\n" + errors);
-    }
+    removedSlots.clear();
     return {};
 }
 
 auto EventRuntime::waitPluginIdle(const std::string_view pluginName) -> Expected<void> {
     if (pluginName.empty()) {
-        return unexpected(ErrorCategory::Event, CommonErrorCode::InvalidArgument, "Plugin name is empty");
+        return {};
     }
-
-    const auto name = std::string(pluginName);
-    if (tActiveListenerPlugins.contains(name)) {
+    if (tActiveDispatchPlugins.contains(pluginName)) {
         return unexpected(ErrorCategory::Event,
                           CommonErrorCode::InvalidState,
-                          "Cannot wait for plugin event listeners from one of its active listener callbacks: " + name);
+                          "cannot unload plugin '" + std::string(pluginName) + "' from inside its own active callback");
     }
-
-    std::unique_lock lock(mMutex);
-    mPluginIdle.wait(lock, [&] { return !mActivePluginListeners.contains(name) || !isEnabled(); });
-    if (mActivePluginListeners.contains(name)) {
+    if (!ReflectPluginRegistry::instance().waitIdleAndRevoke(pluginName, 5000)) {
         return unexpected(ErrorCategory::Event,
-                          CommonErrorCode::InvalidState,
-                          "Event bus became inactive while plugin listeners were still active: " + name);
+                          CommonErrorCode::OperationFailed,
+                          "timed out waiting for active callbacks of plugin '" + std::string(pluginName) +
+                                  "' to finish");
     }
     return {};
 }
@@ -480,96 +795,164 @@ auto EventRuntime::waitPluginIdle(const std::string_view pluginName) -> Expected
 } // namespace CloverNT::Core::Modules
 
 namespace CloverNT::Event {
+
 namespace {
 
-    [[nodiscard]] auto eventBusModule() -> Expected<Core::Modules::ModuleRef<Core::Modules::EventRuntime>> {
+    [[nodiscard]] auto requireEventRuntime() -> Expected<Core::Modules::ModuleRef<Core::Modules::EventRuntime>> {
         return Core::Modules::Manager::getInstance().requireModule<Core::Modules::EventRuntime>();
+    }
+
+    [[nodiscard]] auto validateTopicSyntax(const std::string_view topic) -> Expected<std::size_t> {
+        if (topic.empty()) {
+            return Reflect::bridgeUnexpected(Reflect::BridgeErrorCode::PermissionDenied, "event topic cannot be empty");
+        }
+        const auto colon = topic.find(':');
+        if (colon == 0 || colon == topic.size() - 1) {
+            return Reflect::bridgeUnexpected(Reflect::BridgeErrorCode::PermissionDenied,
+                                             "invalid event topic '" + std::string(topic) +
+                                                     "': expected '<namespace>:<topic>'");
+        }
+        return colon;
     }
 
 } // namespace
 
-EventBus::EventBus() = default;
+namespace Detail {
 
-EventBus::~EventBus() = default;
-
-auto EventBus::getInstance() -> EventBus& {
-    static EventBus instance;
-    return instance;
-}
-
-auto EventBus::registerEvent(const std::string_view eventName, const std::weak_ptr<Plugin::Plugin>& owner)
-        -> Expected<void> {
-    auto module = eventBusModule();
-    if (!module) {
-        return unexpected(module.error());
+    void reportListenerDispatchError(const std::string_view topic,
+                                     const std::string_view ownerPlugin,
+                                     const Error&           error) noexcept {
+        try {
+            coreLogger().error("Event listener (owner '{}') on '{}': {}", ownerPlugin, topic, error.message);
+        } catch (...) {}
     }
-    return module->get().registerEvent(eventName, owner);
-}
 
-auto EventBus::addListener(const ListenerPtr& listener, const std::string_view eventName) -> Expected<void> {
-    auto module = eventBusModule();
-    if (!module) {
-        return unexpected(module.error());
+} // namespace Detail
+
+bool ScopedSubscription::unsubscribe() noexcept {
+    const auto id = std::exchange(mId, kInvalidSubscriptionId);
+    if (id == kInvalidSubscriptionId) {
+        return false;
     }
-    return module->get().addListener(listener, eventName);
+    return EventBus::off(id);
 }
 
-auto EventBus::removeListener(const ListenerPtr& listener) -> Expected<void> {
-    auto module = eventBusModule();
-    if (!module) {
-        return unexpected(module.error());
+auto EventBus::allocateSubscriptionId() noexcept -> SubscriptionId {
+    static std::atomic<SubscriptionId> sNextId{1};
+    return sNextId.fetch_add(1, std::memory_order_relaxed);
+}
+
+auto EventBus::normalizeSubscribeTopic(const std::string_view rawTopic,
+                                       const std::string_view ownerPlugin,
+                                       const bool             normalizeBare) -> Expected<std::string> {
+    const auto colon = validateTopicSyntax(rawTopic);
+    if (!colon) {
+        return unexpected(colon.error());
     }
-    return module->get().removeListener(listener);
-}
-
-auto EventBus::removeListener(const ListenerId id) -> Expected<void> {
-    auto module = eventBusModule();
-    if (!module) {
-        return unexpected(module.error());
+    if (*colon == std::string_view::npos) {
+        if (!normalizeBare) {
+            return Reflect::bridgeUnexpected(Reflect::BridgeErrorCode::PermissionDenied,
+                                             "event topic '" + std::string(rawTopic) +
+                                                     "' must include a '<namespace>:' prefix");
+        }
+        const std::string_view ns = ownerPlugin.empty() ? "CloverCore" : ownerPlugin;
+        return std::string(ns) + ":" + std::string(rawTopic);
     }
-    return module->get().removeListener(id);
+    return std::string(rawTopic);
 }
 
-auto EventBus::getListener(const ListenerId id) -> ListenerPtr {
-    const auto module = eventBusModule();
-    return module ? module->get().getListener(id) : nullptr;
-}
-
-bool EventBus::hasListener(const ListenerId id) {
-    const auto module = eventBusModule();
-    return module && module->get().hasListener(id);
-}
-
-auto EventBus::getListenerCount(const std::string_view eventName) -> std::size_t {
-    const auto module = eventBusModule();
-    return module ? module->get().getListenerCount(eventName) : 0;
-}
-
-auto EventBus::events() -> std::vector<std::string> {
-    const auto module = eventBusModule();
-    return module ? module->get().events() : std::vector<std::string>{};
-}
-
-void EventBus::publish(Event& event, const std::string_view eventName) {
-    if (const auto module = eventBusModule()) {
-        module->get().publish(event, eventName);
+auto EventBus::normalizeEmitTopic(const std::string_view rawTopic,
+                                  const std::string_view ownerPlugin,
+                                  const bool             normalizeBare) -> Expected<std::string> {
+    const auto colon = validateTopicSyntax(rawTopic);
+    if (!colon) {
+        return unexpected(colon.error());
     }
+    const std::string_view effectiveOwner = ownerPlugin.empty() ? "CloverCore" : ownerPlugin;
+    if (*colon == std::string_view::npos) {
+        if (!normalizeBare) {
+            return Reflect::bridgeUnexpected(Reflect::BridgeErrorCode::PermissionDenied,
+                                             "event topic '" + std::string(rawTopic) +
+                                                     "' must include a '<namespace>:' prefix");
+        }
+        if (effectiveOwner == "clovernt") {
+            return Reflect::bridgeUnexpected(Reflect::BridgeErrorCode::PermissionDenied,
+                                             "namespace 'clovernt' is reserved for built-in events");
+        }
+        return std::string(effectiveOwner) + ":" + std::string(rawTopic);
+    }
+
+    const std::string_view ns = rawTopic.substr(0, *colon);
+    if (ns == "clovernt") {
+        return Reflect::bridgeUnexpected(Reflect::BridgeErrorCode::PermissionDenied,
+                                         "namespace 'clovernt' is reserved for built-in events");
+    }
+    if (effectiveOwner != "CloverCore" && ns != effectiveOwner) {
+        return Reflect::bridgeUnexpected(Reflect::BridgeErrorCode::PermissionDenied,
+                                         "plugin '" + std::string(effectiveOwner) +
+                                                 "' cannot emit events in namespace '" + std::string(ns) + "'");
+    }
+    return std::string(rawTopic);
+}
+
+auto EventBus::addSlot(const std::string_view topic, ListenerSlotPtr slot) -> Expected<SubscriptionId> {
+    auto runtime = requireEventRuntime();
+    if (!runtime) {
+        return unexpected(runtime.error());
+    }
+    return runtime->get().addSlot(topic, std::move(slot));
+}
+
+bool EventBus::off(const SubscriptionId id) noexcept {
+    const auto runtime = requireEventRuntime();
+    return runtime && runtime->get().removeSlot(id);
+}
+
+bool EventBus::hasSubscription(const SubscriptionId id) noexcept {
+    const auto runtime = requireEventRuntime();
+    return runtime && runtime->get().hasSubscription(id);
+}
+
+auto EventBus::listenerCount(const std::string_view topic) noexcept -> std::size_t {
+    const auto runtime = requireEventRuntime();
+    return runtime ? runtime->get().listenerCount(topic) : 0;
+}
+
+auto EventBus::topics() -> std::vector<std::string> {
+    const auto runtime = requireEventRuntime();
+    return runtime ? runtime->get().topics() : std::vector<std::string>{};
+}
+
+auto EventBus::dispatchPluginInvocation(EventInvocation& inv) -> Expected<bool> {
+    auto runtime = requireEventRuntime();
+    if (!runtime) {
+        return unexpected(runtime.error());
+    }
+    return runtime->get().dispatch(inv);
+}
+
+auto EventBus::dispatchKernelInvocation(EventInvocation& inv, KernelPublishToken) -> Expected<bool> {
+    auto runtime = requireEventRuntime();
+    if (!runtime) {
+        return unexpected(runtime.error());
+    }
+    return runtime->get().dispatch(inv);
 }
 
 auto EventBus::clearPlugin(const std::string_view pluginName) -> Expected<void> {
-    const auto module = eventBusModule();
-    if (!module) {
-        return unexpected(module.error());
+    auto runtime = requireEventRuntime();
+    if (!runtime) {
+        return unexpected(runtime.error());
     }
-    return module->get().clearPlugin(pluginName);
+    return runtime->get().clearPlugin(pluginName);
 }
 
 auto EventBus::waitPluginIdle(const std::string_view pluginName) -> Expected<void> {
-    const auto module = eventBusModule();
-    if (!module) {
-        return unexpected(module.error());
+    auto runtime = requireEventRuntime();
+    if (!runtime) {
+        return unexpected(runtime.error());
     }
-    return module->get().waitPluginIdle(pluginName);
+    return runtime->get().waitPluginIdle(pluginName);
 }
 
 } // namespace CloverNT::Event

@@ -1,10 +1,17 @@
 #include <CloverNT/API/Utils/System.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <ctime>
+#include <filesystem>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <utility>
 
 #include <dlfcn.h>
+#include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace CloverNT::Utils::System {

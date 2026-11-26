@@ -3,7 +3,6 @@
 #include <CloverNT/API/Expected.hpp>
 #include <CloverNT/Core/Modules/ModuleBase.hpp>
 
-#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -12,6 +11,7 @@
 #include <string_view>
 #include <type_traits>
 #include <typeindex>
+#include <typeinfo>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -88,6 +88,7 @@ public:
                     type, std::make_shared<ModuleInfo<T>>(std::move(factory), std::move(name), std::move(description)));
             mModuleOrder.push_back(type);
         } catch (...) {
+            mModules.erase(type);
             mModuleNameMap.erase(nameIt);
             return unexpected(fromCurrentException(ErrorCategory::Module));
         }
@@ -231,7 +232,14 @@ private:
                 return unexpected(
                         ErrorCategory::Module, CommonErrorCode::OperationFailed, "Module factory returned null");
             }
-            if (auto result = instance->onLoad(); !result) {
+            Expected<void> result;
+            try {
+                result = instance->onLoad();
+            } catch (...) {
+                instance.reset();
+                throw;
+            }
+            if (!result) {
                 instance.reset();
                 return unexpected(result.error());
             }
@@ -278,9 +286,15 @@ private:
                 return {};
             }
 
-            // Publish Enabled before onEnable() so the module observes itself enabled during start-up.
             instance->mState.store(ModuleState::Enabled);
-            if (auto result = instance->onEnable(); !result) {
+            Expected<void> result;
+            try {
+                result = instance->onEnable();
+            } catch (...) {
+                instance->mState.store(ModuleState::Loaded);
+                throw;
+            }
+            if (!result) {
                 instance->mState.store(ModuleState::Loaded);
                 return unexpected(result.error());
             }
@@ -294,7 +308,14 @@ private:
             }
 
             instance->mState.store(ModuleState::Loaded);
-            if (auto result = instance->onDisable(); !result) {
+            Expected<void> result;
+            try {
+                result = instance->onDisable();
+            } catch (...) {
+                instance->mState.store(ModuleState::Enabled);
+                throw;
+            }
+            if (!result) {
                 instance->mState.store(ModuleState::Enabled);
                 return unexpected(result.error());
             }
@@ -331,6 +352,7 @@ private:
 
     bool                                                                 mInitialized{false};
     bool                                                                 mDestroyed{false};
+    bool                                                                 mDestroying{false};
     std::unordered_map<std::type_index, std::shared_ptr<ModuleInfoBase>> mModules;
     std::unordered_map<std::string, std::type_index>                     mModuleNameMap;
     std::vector<std::type_index>                                         mModuleOrder;

@@ -3,7 +3,6 @@
 
 #include <functional>
 #include <memory>
-#include <mutex>
 
 namespace CloverNT::Core::Platform {
 
@@ -25,16 +24,18 @@ public:
 
     void onPreload(node::Environment* env, v8::Local<v8::Value> process, v8::Local<v8::Value> require);
 
+    struct State;
+
 private:
+    static auto createState(Callbacks callbacks) -> std::shared_ptr<State>;
+    static void onPreloadState(const std::shared_ptr<State>& state,
+                               node::Environment*            env,
+                               v8::Local<v8::Value>          process,
+                               v8::Local<v8::Value>          require);
     static void onCleanup(void* arg);
     void        removeCleanupHook();
 
-    Callbacks            mCallbacks;
-    std::recursive_mutex mMutex;
-    v8::Isolate*         mIsolate{};
-    bool                 mCaptured{};
-    bool                 mCleanupHookRegistered{};
-    bool                 mDestroyed{};
+    std::shared_ptr<State> mState;
 
     struct Impl;
     std::unique_ptr<Impl> mImpl;

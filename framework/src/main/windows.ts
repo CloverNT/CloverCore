@@ -33,7 +33,7 @@ export function ensureSettingsWindowWidth(sender: WebContents): void {
 
 export function broadcast<E extends keyof EventMap>(channel: E, ...args: EventMap[E]): void {
     for (const contents of webContents.getAllWebContents()) {
-        if (!contents.isDestroyed() && isTrustedOrigin(contents.mainFrame.origin)) {
+        if (!contents.isDestroyed() && isTrustedOrigin(contents.mainFrame?.origin)) {
             contents.send(channel, ...args);
         }
     }

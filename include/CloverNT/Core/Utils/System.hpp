@@ -16,8 +16,9 @@ namespace CloverNT::Core::Utils::System {
 #ifdef CloverNT_SYSTEM_WINDOWS
     return reinterpret_cast<ModuleHandle>(&__ImageBase);
 #elif defined(CloverNT_SYSTEM_LINUX)
-    Dl_info info{};
-    return ::dladdr(__builtin_return_address(0), &info) != 0 ? info.dli_fbase : nullptr;
+    static int anchor = 0;
+    Dl_info    info{};
+    return ::dladdr(&anchor, &info) != 0 ? info.dli_fbase : nullptr;
 #endif
 }
 

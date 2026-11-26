@@ -1,3 +1,4 @@
+import {errorMessage} from "../../shared/errors";
 import {Channel, type OpenTargetRequest, type PluginActionRequest} from "../../shared/ipc";
 import type {CloverFolder, CloverPluginActionResult, CloverRuntimeApi} from "../../shared/public";
 import {invoke, subscribe} from "./bridge";
@@ -25,7 +26,7 @@ function folderRequest(target: CloverFolder): OpenTargetRequest {
 
 async function act(request: PluginActionRequest): Promise<CloverPluginActionResult & { count: number }> {
     const {ok, error, count} = await invoke(Channel.PluginAction, request);
-    return error ? {ok, error, count} : {ok, count};
+    return error ? {ok, error: errorMessage(error), count} : {ok, count};
 }
 
 export function createRuntimeApi(): CloverRuntimeApi {
@@ -43,7 +44,7 @@ export function createRuntimeApi(): CloverRuntimeApi {
         async openFolder(target: CloverFolder) {
             const error = await invoke(Channel.OpenTarget, folderRequest(target));
             if (error) {
-                throw new Error(error);
+                throw new Error(errorMessage(error));
             }
         },
         onPluginsChange(listener: () => void) {

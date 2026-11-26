@@ -50,6 +50,14 @@ include(cmake/Libc++.cmake)
 include(cmake/QQNTSdk.cmake)
 use_libcxx_globally()
 
+# workaround
+if (WIN32 AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
+        AND NOT EXISTS "${LIBCXX_ROOT}/include/c++/v1/generator")
+    file(WRITE "${CMAKE_BINARY_DIR}/_libcxx_guard/generator"
+            "// \n")
+    include_directories(SYSTEM "${CMAKE_BINARY_DIR}/_libcxx_guard")
+endif ()
+
 FetchContent_Declare(
         CloverLoaderSDK
         GIT_REPOSITORY https://github.com/CloverNT/CloverLoader-Release.git
@@ -85,12 +93,12 @@ set(ALKA_BUILD_ENGINE OFF)
 FetchContent_Declare(
         Alka
         GIT_REPOSITORY https://github.com/SingerBallad/Alka.git
-        GIT_TAG main
+        GIT_TAG develop
         GIT_SHALLOW TRUE
         EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(CloverLoaderSDK libhat nlohmann_json Mortis Alka)
-target_compile_definitions(Alka PUBLIC ALKA_CONTEXT_EMBEDDER_SLOT=30)
+target_compile_definitions(Alka PUBLIC ALKA_CONTEXT_EMBEDDER_SLOT=30 ALKA_HAS_CPPGC=0)
 
 if (WIN32)
     add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -112,9 +120,6 @@ set(CLOVER_API_SOURCES
 )
 
 set(CLOVER_CORE_SOURCES
-        src/Core/Event/Cancellable.cpp
-        src/Core/Event/Listener.cpp
-        src/Core/Event/NamedEvent.cpp
         src/Core/Modules/EventRuntime.cpp
         src/Core/Modules/HookRuntime.cpp
         src/Core/Modules/Manager.cpp
@@ -125,8 +130,8 @@ set(CLOVER_CORE_SOURCES
         src/Core/Modules/PluginRuntime/Bridge/AlkaBindings.cpp
         src/Core/Modules/PluginRuntime/Bridge/Lifecycle.cpp
         src/Core/Modules/PluginRuntime/Bridge/Electron.cpp
-        src/Core/Modules/PluginRuntime/Bridge/EventExports.cpp
         src/Core/Modules/PluginRuntime/Bridge/Events.cpp
+        src/Core/Modules/PluginRuntime/Bridge/ReflectBridge.cpp
         src/Core/Event/PacketBridge.cpp
         src/Core/Platform/DllEventSource.cpp
         src/Core/Platform/NodeEnvironmentGate.cpp
@@ -174,7 +179,7 @@ set_target_properties(CloverCore PROPERTIES
         VISIBILITY_INLINES_HIDDEN ON)
 if (NOT WIN32)
     target_link_options(CloverCore PRIVATE
-            "LINKER:--exclude-libs,libc++.a:libc++abi.a:libhat.a:libMortis.a")
+            "LINKER:--exclude-libs,libc++.a:libc++abi.a:libhat.a:libMortis.a:libAlka.a")
 endif ()
 
 set(CLOVERCORE_MAIN "CloverCore${CMAKE_SHARED_LIBRARY_SUFFIX}")
@@ -199,4 +204,26 @@ if (CLOVERNT_GENERATE_DTS)
             COMMENT "Generating framework/src/clovernt.gen.d.ts from the Alka bindings"
             VERBATIM)
     add_custom_target(CloverDts ALL DEPENDS "${_clovernt_dts}")
+endif ()
+
+option(CLOVERNT_BUILD_TESTS "Build CloverCore native unit tests" ON)
+if (CLOVERNT_BUILD_TESTS)
+    enable_testing()
+    add_executable(CloverEventTests
+            tests/EventAndReflectTests.cpp
+            src/Core/Modules/EventRuntime.cpp
+            src/Core/Modules/Manager.cpp
+            ${CLOVER_API_SOURCES})
+    target_link_libraries(CloverEventTests PRIVATE CloverNT::Runtime)
+    if (WIN32)
+        target_link_libraries(CloverEventTests PRIVATE dbghelp)
+    else ()
+        target_link_libraries(CloverEventTests PRIVATE dl)
+    endif ()
+    target_compile_definitions(CloverEventTests PRIVATE
+            CloverNT_API_STATIC
+            $<$<CONFIG:Debug>:CloverNT_DEBUG>
+            ${CloverNT_SYSTEM_MACRO}
+            ${CloverNT_ARCH_MACRO})
+    add_test(NAME CloverEventTests COMMAND CloverEventTests)
 endif ()

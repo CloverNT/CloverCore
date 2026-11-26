@@ -1,5 +1,6 @@
 #pragma once
 #include <filesystem>
+#include <memory>
 
 #include <CloverNT/API/Plugin/Plugin.hpp>
 #include <CloverNT/API/Utils/DynamicLibrary.hpp>

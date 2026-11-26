@@ -12,14 +12,18 @@ const webp = Buffer.from("UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAUAmJaQAA3AA/v
 
 let scratch;
 let collectPlugins;
+let runPluginAction;
 before(() => {
     scratch = fs.mkdtempSync(join(tmpdir(), "clover-plugins-"));
     const bundle = join(scratch, "main.cjs");
     buildSync({
-        stdin: {resolveDir: resolve(__dirname, "../src/main"), contents: 'export {collectPlugins} from "./plugins";'},
+        stdin: {
+            resolveDir: resolve(__dirname, "../src/main"),
+            contents: 'export {collectPlugins, runPluginAction} from "./plugins";'
+        },
         platform: "node", bundle: true, outfile: bundle, format: "cjs",
     });
-    ({collectPlugins} = require(bundle));
+    ({collectPlugins, runPluginAction} = require(bundle));
 });
 after(() => fs.rmSync(scratch, {recursive: true, force: true}));
 
@@ -111,4 +115,67 @@ test("file symlinks cannot redirect logo reads", (t) => {
         throw error;
     }
     assert.equal(item({logo: "icon.png"}).logoDataUrl, undefined);
+});
+
+test("missing or malformed clover.json falls back to scan metadata without failing collectPlugins", () => {
+    const pluginsDir = fs.mkdtempSync(join(scratch, "plugins-broken-"));
+    const brokenRoot = join(pluginsDir, "Broken");
+    fs.mkdirSync(brokenRoot);
+    fs.writeFileSync(join(brokenRoot, "clover.json"), "{not-valid-json");
+
+    const binding = {
+        pluginsDir,
+        pluginManager: {
+            scan: () => [
+                {
+                    name: "cloverjs:Broken",
+                    type: "cloverjs",
+                    loaded: false,
+                    unloadable: true,
+                    builtin: false,
+                    passive: false
+                },
+                {
+                    name: "ext:NoDiskManifest",
+                    type: "ext",
+                    loaded: true,
+                    unloadable: true,
+                    builtin: false,
+                    passive: false
+                },
+            ],
+        },
+    };
+
+    const items = collectPlugins(binding);
+    assert.equal(items.length, 2);
+    assert.deepEqual(items.map((p) => ({id: p.id, entries: p.entries, dependencies: p.dependencies})), [
+        {id: "ext:NoDiskManifest", entries: [], dependencies: []},
+        {id: "cloverjs:Broken", entries: [], dependencies: []},
+    ]);
+});
+
+test("runPluginAction validates action kind and plugin name", () => {
+    const calls = [];
+    const binding = {
+        pluginsDir: scratch,
+        pluginManager: {
+            loadWithResult: (name) => (calls.push(["load", name]), {ok: true, error: "", count: 0}),
+            unloadWithResult: (name) => (calls.push(["unload", name]), {ok: true, error: "", count: 0}),
+            reloadWithResult: (name) => (calls.push(["reload", name]), {ok: true, error: "", count: 0}),
+            rescanWithResult: () => (calls.push(["rescan"]), {ok: true, error: "", count: 2}),
+        },
+    };
+
+    assert.deepEqual(runPluginAction(binding, {action: "rescan"}), {ok: true, error: "", count: 2});
+    assert.deepEqual(runPluginAction(binding, {action: "reload", name: "cloverjs:Greeting"}), {
+        ok: true,
+        error: "",
+        count: 0
+    });
+    assert.deepEqual(calls, [["rescan"], ["reload", "cloverjs:Greeting"]]);
+
+    assert.throws(() => runPluginAction(binding, null), TypeError);
+    assert.throws(() => runPluginAction(binding, {action: "__proto__", name: "x"}), TypeError);
+    assert.throws(() => runPluginAction(binding, {action: "load", name: ""}), TypeError);
 });

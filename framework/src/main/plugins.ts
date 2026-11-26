@@ -32,18 +32,33 @@ function kindOf(type: string): PluginKind {
     return type === "clover" ? "native" : type === "cloverjs" ? "js" : "external";
 }
 
-function dependencies(constraints: Record<string, string> = {}, optional: boolean): PluginDependency[] {
-    return Object.entries(constraints).map(([name, version]) => ({
+function dependencies(constraints: unknown, optional: boolean): PluginDependency[] {
+    if (constraints === null || typeof constraints !== "object" || Array.isArray(constraints)) {
+        return [];
+    }
+    return Object.entries(constraints as Record<string, unknown>).map(([name, version]) => ({
         name,
-        version: version && version !== "*" ? version : undefined,
+        version: typeof version === "string" && version.length > 0 && version !== "*" ? version : undefined,
         optional,
     }));
+}
+
+function readManifestSafe(directory: string): Manifest {
+    try {
+        const parsed: unknown = JSON.parse(readFileSync(join(directory, "clover.json"), "utf8"));
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return parsed as Manifest;
+        }
+    } catch {
+        // Fall back to scan metadata when clover.json is missing or unreadable.
+    }
+    return {};
 }
 
 function toItem(scan: PluginScan, pluginsDir: string): PluginItem {
     const name = scan.name.slice(scan.name.indexOf(":") + 1);
     const directory = join(pluginsDir, name);
-    const manifest = JSON.parse(readFileSync(join(directory, "clover.json"), "utf8")) as Manifest;
+    const manifest = readManifestSafe(directory);
     return {
         id: scan.name,
         name,
@@ -56,7 +71,7 @@ function toItem(scan: PluginScan, pluginsDir: string): PluginItem {
         loaded: scan.loaded,
         unloadable: scan.unloadable,
         logoDataUrl: typeof manifest.logo === "string" ? readPluginLogo(directory, manifest.logo) : undefined,
-        entries: (Object.keys(ENTRY_FIELDS) as PluginEntryKind[]).filter((kind) => manifest[ENTRY_FIELDS[kind]]),
+        entries: (Object.keys(ENTRY_FIELDS) as PluginEntryKind[]).filter((kind) => Boolean(manifest[ENTRY_FIELDS[kind]])),
         dependencies: [
             ...dependencies(manifest.dependencies, false),
             ...dependencies(manifest.optionalDependencies, true),
@@ -73,11 +88,32 @@ export function collectPlugins(binding: CloverBinding): PluginItem[] {
 }
 
 export function runPluginAction(binding: CloverBinding, request: PluginActionRequest): PluginActionResult {
+    if (request === null || typeof request !== "object") {
+        throw new TypeError("Invalid plugin action request");
+    }
     const manager = binding.pluginManager;
-    const result =
-        request.action === "rescan"
-            ? manager.rescanWithResult()
-            : manager[`${request.action}WithResult`](request.name);
+    let result: PluginActionResult;
+    switch (request.action) {
+        case "rescan":
+            result = manager.rescanWithResult();
+            break;
+        case "load":
+        case "unload":
+        case "reload": {
+            if (typeof request.name !== "string" || request.name.length === 0) {
+                throw new TypeError(`Invalid plugin name for action '${request.action}'`);
+            }
+            result =
+                request.action === "load"
+                    ? manager.loadWithResult(request.name)
+                    : request.action === "unload"
+                        ? manager.unloadWithResult(request.name)
+                        : manager.reloadWithResult(request.name);
+            break;
+        }
+        default:
+            throw new TypeError(`Unsupported plugin action: ${String((request as { action?: unknown }).action)}`);
+    }
     // Native result objects expose prototype getters, which IPC serialization would drop.
     return {ok: result.ok, error: result.error, count: result.count};
 }

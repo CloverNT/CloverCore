@@ -25,15 +25,25 @@ interface RenderTarget {
 
 function createProgram(gl: WebGL2RenderingContext, vertex: string, fragment: string): Program {
     const program = gl.createProgram();
-    for (const [type, source] of [[gl.VERTEX_SHADER, vertex], [gl.FRAGMENT_SHADER, fragment]] as const) {
-        const shader = gl.createShader(type)!;
-        gl.shaderSource(shader, source);
-        gl.compileShader(shader);
-        gl.attachShader(program, shader);
-    }
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        throw new Error(gl.getProgramInfoLog(program) ?? "shader program failed to link");
+    const shaders: WebGLShader[] = [];
+    try {
+        for (const [type, source] of [[gl.VERTEX_SHADER, vertex], [gl.FRAGMENT_SHADER, fragment]] as const) {
+            const shader = gl.createShader(type)!;
+            shaders.push(shader);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            gl.attachShader(program, shader);
+        }
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            const log = gl.getProgramInfoLog(program) ?? "shader program failed to link";
+            gl.deleteProgram(program);
+            throw new Error(log);
+        }
+    } finally {
+        for (const shader of shaders) {
+            gl.deleteShader(shader);
+        }
     }
     const uniforms = new Map<string, WebGLUniformLocation | null>();
     for (let i = 0; i < gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS); i++) {
@@ -61,16 +71,33 @@ export class ModelViewer {
     private scene!: Program;
     private grade!: Program;
     private vertexArray!: WebGLVertexArrayObject;
+    private vertexBuffers: WebGLBuffer[] = [];
     private indexBuffer!: WebGLBuffer;
     private baseColor!: WebGLTexture;
     private dfg!: WebGLTexture;
     private lut!: WebGLTexture;
     private target: RenderTarget | undefined;
+    private disposed = false;
 
     private readonly centroids: Float32Array<ArrayBuffer>;
     private readonly depths: Float32Array<ArrayBuffer>;
     private readonly order: Uint32Array<ArrayBuffer>;
     private readonly sortedIndices: Uint16Array<ArrayBuffer>;
+
+    private readonly onContextLost = (event: Event): void => {
+        event.preventDefault();
+    };
+
+    private readonly onContextRestored = (): void => {
+        if (this.disposed) {
+            return;
+        }
+        this.target = undefined;
+        if (!this.gl.getExtension("EXT_color_buffer_float")) {
+            return;
+        }
+        this.createResources();
+    };
 
     constructor(
         private readonly canvas: HTMLCanvasElement,
@@ -97,15 +124,48 @@ export class ModelViewer {
         this.sortedIndices = new Uint16Array(indices.length);
 
         this.createResources();
-        canvas.addEventListener("webglcontextrestored", () => {
-            this.target = undefined;
-            this.createResources();
-        });
+        canvas.addEventListener("webglcontextlost", this.onContextLost);
+        canvas.addEventListener("webglcontextrestored", this.onContextRestored);
         this.motion = new ModelMotion(stage);
         this.loop = new FrameLoop(canvas, (now) => this.render(now), {
             onStart: () => this.motion.resume(),
             onStop: () => this.motion.pause(),
         });
+    }
+
+    dispose(): void {
+        if (this.disposed) {
+            return;
+        }
+        this.disposed = true;
+        this.loop.stop();
+        this.motion.dispose();
+        this.canvas.removeEventListener("webglcontextlost", this.onContextLost);
+        this.canvas.removeEventListener("webglcontextrestored", this.onContextRestored);
+
+        const {gl} = this;
+        if (!gl.isContextLost()) {
+            if (this.target) {
+                gl.deleteFramebuffer(this.target.msaa);
+                gl.deleteFramebuffer(this.target.resolve);
+                gl.deleteTexture(this.target.texture);
+                this.target.renderbuffers.forEach((buffer) => gl.deleteRenderbuffer(buffer));
+                this.target = undefined;
+            }
+            gl.deleteProgram(this.scene?.program ?? null);
+            gl.deleteProgram(this.grade?.program ?? null);
+            gl.deleteVertexArray(this.vertexArray ?? null);
+            for (const buffer of this.vertexBuffers) {
+                gl.deleteBuffer(buffer);
+            }
+            gl.deleteBuffer(this.indexBuffer ?? null);
+            gl.deleteTexture(this.baseColor ?? null);
+            gl.deleteTexture(this.dfg ?? null);
+            gl.deleteTexture(this.lut ?? null);
+            gl.getExtension("WEBGL_lose_context")?.loseContext();
+        }
+        this.target = undefined;
+        this.vertexBuffers = [];
     }
 
     private createResources(): void {
@@ -115,11 +175,13 @@ export class ModelViewer {
 
         this.vertexArray = gl.createVertexArray();
         gl.bindVertexArray(this.vertexArray);
-        [model.positions, model.normals, model.uvs].forEach((data, location) => {
-            gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+        this.vertexBuffers = [model.positions, model.normals, model.uvs].map((data, location) => {
+            const buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
             gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
             gl.enableVertexAttribArray(location);
             gl.vertexAttribPointer(location, location === 2 ? 2 : 3, gl.FLOAT, false, 0, 0);
+            return buffer;
         });
         this.indexBuffer = gl.createBuffer();
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);

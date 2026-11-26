@@ -264,3 +264,44 @@ test("a corrupt settings file is reported, and the next save replaces it", () =>
     fonts.writeFonts(file, {ui: choice({family: "Inter"}), mono: choice({})});
     assert.equal(fonts.readFonts(file).ui.family, "Inter");
 });
+
+test("malformed fonts with absurd table lengths or TTC counts are skipped safely", async () => {
+    const badDir = fs.mkdtempSync(join(scratch, "bad-fonts-"));
+    // TTC header claiming 0xffffffff faces
+    const badTtc = Buffer.alloc(16);
+    badTtc.write("ttcf", 0, "ascii");
+    badTtc.writeUInt32BE(0xffffffff, 8);
+    fs.writeFileSync(join(badDir, "huge.ttc"), badTtc);
+    // Single font with name table claiming 1 GiB length
+    const badTtf = Buffer.alloc(32);
+    badTtf.writeUInt32BE(0x00010000, 0);
+    badTtf.writeUInt16BE(1, 4);
+    badTtf.write("name", 12, "ascii");
+    badTtf.writeUInt32BE(28, 20);
+    badTtf.writeUInt32BE(0x40000000, 24);
+    fs.writeFileSync(join(badDir, "huge-table.ttf"), badTtf);
+    assert.deepEqual(await fonts.scanFonts([badDir]), []);
+});
+
+test("concurrent saveFonts and completeFonts serialize cleanly without clobbering newer saves", async () => {
+    const coreDir = fs.mkdtempSync(join(scratch, "race-"));
+    const file = fonts.settingsFile(coreDir);
+    fs.mkdirSync(join(coreDir, "config"));
+    fs.writeFileSync(file, JSON.stringify({fonts: {ui: "Test Sans", mono: ""}}));
+
+    let releaseScan;
+    const slowList = () => new Promise((res) => {
+        releaseScan = () => res(families);
+    });
+    const completing = fonts.completeFonts(file, slowList);
+    // While completeFonts is scanning, user concurrently updates ui and mono
+    const saveUi = fonts.saveFonts(file, {ui: {family: "Test Mono"}}, async () => families);
+    const saveMono = fonts.saveFonts(file, {mono: {family: "Test Sans"}}, async () => families);
+    await Promise.all([saveUi, saveMono]);
+    releaseScan();
+    assert.equal(await completing, undefined, "completeFonts must not clobber a newer save");
+    const final = fonts.readFonts(file);
+    assert.equal(final.ui.family, "Test Mono");
+    assert.equal(final.mono.family, "Test Sans");
+    assert.ok(final.ui.faces.length > 0 && final.mono.faces.length > 0);
+});

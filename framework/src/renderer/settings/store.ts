@@ -51,6 +51,7 @@ export class SettingsStore {
 
     private readonly listeners = new Set<() => void>();
     private refreshing$: Promise<void> | undefined;
+    private refreshQueued = false;
 
     subscribe(listener: () => void): () => void {
         this.listeners.add(listener);
@@ -64,7 +65,22 @@ export class SettingsStore {
     }
 
     refresh(): Promise<void> {
-        return (this.refreshing$ ??= this.load().finally(() => {
+        if (this.refreshing$) {
+            this.refreshQueued = true;
+            return this.refreshing$;
+        }
+        const run = async (): Promise<void> => {
+            do {
+                this.refreshQueued = false;
+                try {
+                    await this.load();
+                } catch (error) {
+                    this.refreshQueued = false;
+                    throw error;
+                }
+            } while (this.refreshQueued);
+        };
+        return (this.refreshing$ = run().finally(() => {
             this.refreshing$ = undefined;
         }));
     }
@@ -79,6 +95,9 @@ export class SettingsStore {
     }
 
     setGuardMask(mask: number | null): void {
+        if (this.guardMask === mask) {
+            return;
+        }
         this.guardMask = mask;
         this.emit();
     }

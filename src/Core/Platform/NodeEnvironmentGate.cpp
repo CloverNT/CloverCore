@@ -4,12 +4,29 @@
 #include <CloverNT/Core/Utils/System.hpp>
 
 #include <exception>
+#include <filesystem>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #include <QQNT/uv.h>
 
 namespace CloverNT::Core::Platform {
+
+struct NodeEnvironmentGate::State {
+    Callbacks               callbacks;
+    std::recursive_mutex    mutex;
+    v8::Isolate*            isolate{};
+    std::thread::id         loopThreadId{};
+    std::shared_ptr<State>* cleanupToken{};
+    bool                    captured{};
+    bool                    cleanupHookRegistered{};
+    bool                    destroyed{};
+
+    explicit State(Callbacks cb) : callbacks(std::move(cb)) {}
+};
 
 namespace {
 
@@ -26,12 +43,12 @@ namespace {
         std::filesystem::path coreDir;
         bool                  present{};
         bool                  runnable{};
-        uv_thread_t           loopThread{}; // thread that published the env (the Node loop thread)
+        uv_thread_t           loopThread{};
     };
 
     Holder& holder() {
-        static Holder instance;
-        return instance;
+        static auto* instance = new Holder();
+        return *instance;
     }
 
 } // namespace
@@ -51,7 +68,12 @@ void NodeEnvironment::publish(const EnvironmentContext& context) {
 void NodeEnvironment::clear() {
     auto& [mutex, env, isolate, require, coreDir, present, runnable, loopThread] = holder();
     std::lock_guard lock(mutex);
-    require.Reset();
+    if (present && isolate != nullptr) {
+        const auto self = uv_thread_self();
+        if (uv_thread_equal(&self, &loopThread) != 0) {
+            require.Reset();
+        }
+    }
     env     = nullptr;
     isolate = nullptr;
     coreDir.clear();
@@ -94,28 +116,58 @@ bool NodeEnvironment::current(EnvironmentContext& out) {
     return true;
 }
 
+auto NodeEnvironmentGate::createState(Callbacks callbacks) -> std::shared_ptr<State> {
+    return std::make_shared<State>(std::move(callbacks));
+}
+
 void NodeEnvironmentGate::onPreload(node::Environment*         env,
-                                              const v8::Local<v8::Value> process,
-                                              const v8::Local<v8::Value> require) {
+                                    const v8::Local<v8::Value> process,
+                                    const v8::Local<v8::Value> require) {
+    onPreloadState(mState, env, process, require);
+}
+
+void NodeEnvironmentGate::onPreloadState(const std::shared_ptr<State>& state,
+                                         node::Environment*            env,
+                                         const v8::Local<v8::Value>    process,
+                                         const v8::Local<v8::Value>    require) {
     try {
         (void) process;
+        if (!state) {
+            return;
+        }
         v8::Isolate* isolate = v8::Isolate::GetCurrent();
         if (isolate == nullptr) {
             return;
         }
+
+        std::shared_ptr<State>* token = nullptr;
         {
-            std::lock_guard lock(mMutex);
-            if (mCaptured) {
+            std::lock_guard lock(state->mutex);
+            if (state->destroyed || state->captured) {
                 return;
             }
-            mCaptured = true;
-            mIsolate  = isolate;
+            state->captured     = true;
+            state->isolate      = isolate;
+            state->loopThreadId = std::this_thread::get_id();
+            token               = new std::shared_ptr(state);
+            state->cleanupToken = token;
         }
 
-        node::AddEnvironmentCleanupHook(isolate, &NodeEnvironmentGate::onCleanup, this);
+        node::AddEnvironmentCleanupHook(isolate, &NodeEnvironmentGate::onCleanup, token);
+
+        std::function<void(const EnvironmentContext&)> onReady;
         {
-            std::lock_guard lock(mMutex);
-            mCleanupHookRegistered = true;
+            std::lock_guard lock(state->mutex);
+            if (state->destroyed) {
+                if (state->cleanupToken == token) {
+                    node::RemoveEnvironmentCleanupHook(isolate, &NodeEnvironmentGate::onCleanup, token);
+                    state->cleanupToken = nullptr;
+                    delete token;
+                }
+                return;
+            }
+            state->cleanupHookRegistered = true;
+            onReady                      = state->callbacks.onEnvironmentReady;
         }
 
         const EnvironmentContext context{
@@ -125,8 +177,8 @@ void NodeEnvironmentGate::onPreload(node::Environment*         env,
                 .require = require,
                 .coreDir = CloverNT::Utils::System::GetModuleDirectory(Utils::System::GetCurrentModuleHandle()),
         };
-        if (mCallbacks.onEnvironmentReady) {
-            mCallbacks.onEnvironmentReady(context);
+        if (onReady) {
+            onReady(context);
         }
     } catch (const std::exception& e) {
         logger().error("NodeEnvironmentGate::onPreload faulted: {}", e.what());
@@ -136,20 +188,28 @@ void NodeEnvironmentGate::onPreload(node::Environment*         env,
 }
 
 void NodeEnvironmentGate::onCleanup(void* arg) {
+    auto* token = static_cast<std::shared_ptr<State>*>(arg);
+    if (token == nullptr) {
+        return;
+    }
+    const std::shared_ptr<State> state = *token;
+    delete token;
+
     try {
-        auto* self = static_cast<NodeEnvironmentGate*>(arg);
-        if (self == nullptr) {
+        if (!state) {
             return;
         }
         std::function<void()> destroyed;
         {
-            std::lock_guard lock(self->mMutex);
-            if (self->mDestroyed) {
+            std::lock_guard lock(state->mutex);
+            state->cleanupToken          = nullptr;
+            state->cleanupHookRegistered = false;
+            if (state->destroyed) {
                 return;
             }
-            self->mDestroyed             = true;
-            self->mCleanupHookRegistered = false;
-            destroyed                    = self->mCallbacks.onEnvironmentDestroyed;
+            state->destroyed = true;
+            destroyed        = std::move(state->callbacks.onEnvironmentDestroyed);
+            state->callbacks = {};
         }
         if (destroyed) {
             destroyed();
@@ -162,11 +222,20 @@ void NodeEnvironmentGate::onCleanup(void* arg) {
 }
 
 void NodeEnvironmentGate::removeCleanupHook() {
-    std::lock_guard lock(mMutex);
-    if (mCleanupHookRegistered && mIsolate != nullptr) {
-        node::RemoveEnvironmentCleanupHook(mIsolate, &NodeEnvironmentGate::onCleanup, this);
+    if (!mState) {
+        return;
     }
-    mCleanupHookRegistered = false;
+    std::lock_guard lock(mState->mutex);
+    mState->destroyed = true;
+    mState->callbacks = {};
+    if (mState->cleanupHookRegistered && mState->isolate != nullptr && mState->cleanupToken != nullptr &&
+        std::this_thread::get_id() == mState->loopThreadId) {
+        auto* token                   = mState->cleanupToken;
+        mState->cleanupToken          = nullptr;
+        mState->cleanupHookRegistered = false;
+        node::RemoveEnvironmentCleanupHook(mState->isolate, &NodeEnvironmentGate::onCleanup, token);
+        delete token;
+    }
 }
 
 } // namespace CloverNT::Core::Platform

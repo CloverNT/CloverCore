@@ -3,10 +3,16 @@
 #include <Windows.h>
 // dbghelp.h must follow Windows.h.
 #include <dbghelp.h>
+#include <malloc.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace CloverNT {
 
@@ -49,8 +55,9 @@ namespace {
 
     void fillRecord(detail::FaultRecord& record, const EXCEPTION_POINTERS* pointers) noexcept {
         const EXCEPTION_RECORD* exceptionRecord = pointers != nullptr ? pointers->ExceptionRecord : nullptr;
+        DWORD                   code            = 0;
         if (exceptionRecord != nullptr) {
-            const DWORD code  = exceptionRecord->ExceptionCode;
+            code              = exceptionRecord->ExceptionCode;
             record.nativeCode = static_cast<std::uint32_t>(code);
             record.kind       = sehCodeToKind(code);
             record.address    = exceptionRecord->ExceptionAddress;
@@ -66,9 +73,16 @@ namespace {
             }
         }
 
+        if (code == EXCEPTION_STACK_OVERFLOW) {
+            record.frameCount = record.address != nullptr ? 1 : 0;
+            if (record.address != nullptr) {
+                record.frames[0] = record.address;
+            }
+            return;
+        }
+
         void*        frames[detail::kFaultMaxFrames];
-        const USHORT captured =
-                RtlCaptureStackBackTrace(0, static_cast<DWORD>(detail::kFaultMaxFrames), frames, nullptr);
+        const USHORT captured = RtlCaptureStackBackTrace(0, detail::kFaultMaxFrames, frames, nullptr);
         record.frameCount = captured;
         for (USHORT i = 0; i < captured; ++i) {
             record.frames[i] = frames[i];
@@ -86,41 +100,6 @@ namespace {
             return SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
         }();
         return initialized;
-    }
-
-    struct VehFrame {
-        CONTEXT              landing;
-        detail::FaultRecord* record;
-        volatile bool        faulted;
-    };
-
-    thread_local VehFrame* tlsVehFrame = nullptr;
-
-    struct GuardScope {
-        VehFrame* previous;
-        ~GuardScope() {
-            tlsVehFrame = previous;
-        }
-    };
-
-    auto CALLBACK vectoredHandler(EXCEPTION_POINTERS* pointers) -> LONG {
-        if (const DWORD code = pointers->ExceptionRecord->ExceptionCode; !shouldTranslate(code)) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        VehFrame* frame = tlsVehFrame;
-        if (frame == nullptr) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-
-        fillRecord(*frame->record, pointers);
-        frame->faulted           = true;
-        *pointers->ContextRecord = frame->landing;
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-
-    void ensureVectoredHandler() {
-        static std::once_flag once;
-        std::call_once(once, [] { AddVectoredExceptionHandler(1 /*first*/, &vectoredHandler); });
     }
 
     auto structuredFilter(const DWORD code, const EXCEPTION_POINTERS* pointers, detail::FaultRecord& record) noexcept
@@ -146,7 +125,11 @@ auto StackTrace::capture(const std::size_t skip, const std::size_t maxFrames) no
 
     const USHORT captured =
             RtlCaptureStackBackTrace(static_cast<DWORD>(skip + 1), static_cast<DWORD>(want), buffer, nullptr);
-    trace.mAddresses.assign(buffer, buffer + captured);
+    try {
+        trace.mAddresses.assign(buffer, buffer + captured);
+    } catch (...) {
+        trace.mAddresses.clear();
+    }
     return trace;
 }
 
@@ -228,19 +211,7 @@ auto sehCodeName(std::uint32_t code) noexcept -> std::string_view {
 }
 
 bool detail::vehTry(void (*invoke)(void*), void* ctx, FaultRecord& record) {
-    ensureVectoredHandler();
-
-    VehFrame frame{};
-    frame.record  = &record;
-    frame.faulted = false;
-    const GuardScope scope{tlsVehFrame};
-    tlsVehFrame = &frame;
-
-    RtlCaptureContext(&frame.landing);
-    if (!frame.faulted) {
-        invoke(ctx);
-    }
-    return !frame.faulted;
+    return sehTry(invoke, ctx, record);
 }
 
 bool detail::sehTry(void (*invoke)(void*), void* ctx, FaultRecord& record) {
@@ -248,6 +219,9 @@ bool detail::sehTry(void (*invoke)(void*), void* ctx, FaultRecord& record) {
         invoke(ctx);
         return true;
     } __except (structuredFilter(GetExceptionCode(), GetExceptionInformation(), record)) {
+        if (record.kind == FaultKind::StackOverflow) {
+            (void) _resetstkoflw();
+        }
         return false;
     }
 }

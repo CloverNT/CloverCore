@@ -73,15 +73,17 @@ void Load(const ModuleHandle) {
             return;
         }
 
+        Platform::startDllEventSource();
+
         gEnvironmentGate = std::make_unique<Platform::NodeEnvironmentGate>(Platform::NodeEnvironmentGate::Callbacks{
                 .onEnvironmentReady =
                         [](const Platform::EnvironmentContext& environment) {
                             Platform::NodeEnvironment::publish(environment);
+                            Event::startPacketBridge();
                             if (auto enabled = Modules::Manager::getInstance().enableAll(); !enabled) {
                                 logger().fatal("Failed to enable modules for the Node environment: {}",
                                                enabled.error().message);
                             }
-                            Event::startPacketBridge();
                         },
                 .onEnvironmentDestroyed =
                         [] {
@@ -94,8 +96,6 @@ void Load(const ModuleHandle) {
                         },
         });
         gEnvironmentGate->arm();
-
-        Platform::startDllEventSource();
     } catch (const Exception& e) {
         logger().fatal("Failed to load core: {}", e.describe());
     } catch (std::exception const& exception) {
@@ -107,6 +107,8 @@ void Load(const ModuleHandle) {
 
 void Unload(const ModuleHandle) {
     try {
+        Event::stopPacketBridge();
+        Platform::NodeEnvironment::markStopped();
         Platform::stopDllEventSource();
         gEnvironmentGate.reset();
         if (auto destroyed = Modules::Manager::getInstance().destroy(); !destroyed) {

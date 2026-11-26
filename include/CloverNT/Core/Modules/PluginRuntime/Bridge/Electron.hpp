@@ -1,5 +1,4 @@
 #pragma once
-#include <CloverNT/Core/Modules/PluginRuntime/Bridge/Support.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/JsRuntimeState.hpp>
 
 namespace CloverNT::Core::Modules::bridge {

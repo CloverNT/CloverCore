@@ -1,7 +1,6 @@
 #pragma once
 
 #include <filesystem>
-#include <string>
 #include <string_view>
 
 #include <CloverNT/API/Expected.hpp>
@@ -45,7 +44,6 @@ public:
 private:
     friend class Core::Modules::PluginRuntime;
 
-    // Dangerous final-shutdown escape hatch: drops ownership without closing the library.
     void releaseWithoutClose() noexcept;
 
     void* mHandle{};

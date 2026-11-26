@@ -13,17 +13,25 @@ export function h<K extends keyof HTMLElementTagNameMap>(
     const element = document.createElement(tag);
     const attrs: Attributes = typeof attributes === "string" ? {class: attributes} : attributes;
     for (const [name, value] of Object.entries(attrs)) {
-        if (value === undefined || value === false) {
+        if (value === undefined || value === null) {
             continue;
         }
         if (name === "class") {
-            element.className = value as string;
+            if (value !== false) {
+                element.className = value as string;
+            }
         } else if (name.startsWith("on") && typeof value === "function") {
             element.addEventListener(name.slice(2).toLowerCase(), value as EventListener);
+        } else if (name === "contentEditable" && typeof value === "boolean") {
+            element.contentEditable = String(value);
         } else if (name in element) {
             (element as unknown as Record<string, unknown>)[name] = value;
+        } else if (value === false) {
+            if (name.startsWith("aria-")) {
+                element.setAttribute(name, "false");
+            }
         } else {
-            element.setAttribute(name, String(value));
+            element.setAttribute(name, value === true && !name.startsWith("aria-") ? "" : String(value));
         }
     }
     element.append(...children.filter((child): child is Node | string => Boolean(child)));

@@ -5,8 +5,8 @@
 #include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
-#include <type_traits>
 #include <utility>
 
 namespace CloverNT {
@@ -50,23 +50,81 @@ struct Error {
 template <class T>
 using Expected = std::expected<T, Error>;
 
+[[nodiscard]] inline auto normalizeErrorMessage(std::string_view message) -> std::string {
+    while (!message.empty() && (message.front() == ' ' || message.front() == '\t')) {
+        message.remove_prefix(1);
+    }
+    if (message.empty()) {
+        return {};
+    }
+
+    constexpr std::string_view kIpcPrefix       = "Error invoking remote method '";
+    constexpr std::string_view kErrorPrefixes[] = {
+            "Error:",
+            "TypeError:",
+            "RangeError:",
+            "SyntaxError:",
+            "ReferenceError:",
+            "URIError:",
+            "EvalError:",
+            "AggregateError:",
+    };
+
+    std::string_view stripped = message;
+    bool             changed  = true;
+    while (changed) {
+        changed = false;
+        while (!stripped.empty() && (stripped.front() == ' ' || stripped.front() == '\t')) {
+            stripped.remove_prefix(1);
+        }
+        if (stripped.starts_with(kIpcPrefix)) {
+            if (const auto closePos = stripped.find("':", kIpcPrefix.size()); closePos != std::string_view::npos) {
+                auto rest = stripped.substr(closePos + 2);
+                while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) {
+                    rest.remove_prefix(1);
+                }
+                if (!rest.empty()) {
+                    stripped = rest;
+                    changed  = true;
+                    continue;
+                }
+            }
+        }
+        for (const auto prefix: kErrorPrefixes) {
+            if (stripped.starts_with(prefix)) {
+                auto rest = stripped.substr(prefix.size());
+                while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) {
+                    rest.remove_prefix(1);
+                }
+                if (!rest.empty()) {
+                    stripped = rest;
+                    changed  = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    return std::string(stripped);
+}
+
 [[nodiscard]] inline auto makeError(const ErrorCategory category,
-                                    std::string         message,
+                                    const std::string&  message,
                                     const std::int32_t  code = static_cast<std::int32_t>(CommonErrorCode::Unknown),
                                     const std::optional<std::int64_t> nativeCode = std::nullopt) -> Error {
     return Error{
             .category   = category,
             .code       = code,
-            .message    = std::move(message),
+            .message    = normalizeErrorMessage(message),
             .nativeCode = nativeCode,
     };
 }
 
 [[nodiscard]] inline auto makeError(const ErrorCategory               category,
                                     const CommonErrorCode             code,
-                                    std::string                       message,
+                                    const std::string&                message,
                                     const std::optional<std::int64_t> nativeCode = std::nullopt) -> Error {
-    return makeError(category, std::move(message), static_cast<std::int32_t>(code), nativeCode);
+    return makeError(category, message, static_cast<std::int32_t>(code), nativeCode);
 }
 
 [[nodiscard]] inline auto unexpected(const Error& error) -> std::unexpected<Error> {
@@ -74,19 +132,19 @@ using Expected = std::expected<T, Error>;
 }
 
 [[nodiscard]] inline auto unexpected(const ErrorCategory category,
-                                     std::string         message,
+                                     const std::string&  message,
                                      const std::int32_t  code = static_cast<std::int32_t>(CommonErrorCode::Unknown),
                                      const std::optional<std::int64_t> nativeCode = std::nullopt)
         -> std::unexpected<Error> {
-    return unexpected(makeError(category, std::move(message), code, nativeCode));
+    return unexpected(makeError(category, message, code, nativeCode));
 }
 
 [[nodiscard]] inline auto unexpected(const ErrorCategory               category,
                                      const CommonErrorCode             code,
-                                     std::string                       message,
+                                     const std::string&                message,
                                      const std::optional<std::int64_t> nativeCode = std::nullopt)
         -> std::unexpected<Error> {
-    return unexpected(makeError(category, code, std::move(message), nativeCode));
+    return unexpected(makeError(category, code, message, nativeCode));
 }
 
 [[nodiscard]] inline auto fromStdErrorCode(std::error_code     error,
@@ -97,7 +155,7 @@ using Expected = std::expected<T, Error>;
         message += ": ";
     }
     message += error.message();
-    return makeError(category, std::move(message), error.value(), error.value());
+    return makeError(category, message, error.value(), error.value());
 }
 
 [[nodiscard]] inline auto fromException(std::exception const& exception,

@@ -206,7 +206,7 @@ export function developerView({store}: ViewContext): View {
         developerModeGroup(),
     ]);
     const timer = setInterval(() => {
-        if (!document.hidden && store.guardPending === undefined && store.guardMask !== null) {
+        if (view.element.isConnected && !document.hidden && store.guardPending === undefined && store.guardMask !== null) {
             store.syncGuard().catch(() => undefined); // the next poll retries
         }
     }, GUARD_POLL_MS);

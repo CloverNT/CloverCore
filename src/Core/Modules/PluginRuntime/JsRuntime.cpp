@@ -1,35 +1,115 @@
+#include <CloverNT/API/Events/EventBus.hpp>
 #include <CloverNT/API/Plugin/JsPlugin.hpp>
+#include <CloverNT/API/Plugin/PluginManager.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/AlkaBindings.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Binding.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Electron.hpp>
-#include <CloverNT/Core/Modules/PluginRuntime/Bridge/Events.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Lifecycle.hpp>
+#include <CloverNT/Core/Modules/PluginRuntime/Bridge/ReflectBridge.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/Bridge/Support.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/JsRuntimeState.hpp>
 #include <CloverNT/Core/Platform/NodeEnvironment.hpp>
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <exception>
 #include <filesystem>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
-#include <Alka/Install.hpp>
+#include <Alka/Convert/Records.hpp>
+#include <Alka/Runtime/Install.hpp>
 
 namespace CloverNT::Core::Modules {
 
-JsRuntime::State::State(Callbacks callbacks) : mCallbacks(std::move(callbacks)) {}
+namespace {
+
+    auto allocateImmortalSelfCell(JsRuntime::State* owner) -> JsRuntime::State::SelfCell* {
+        static std::mutex                             poolMutex;
+        static std::deque<JsRuntime::State::SelfCell> pool;
+        std::lock_guard                               lock(poolMutex);
+        auto&                                         cell = pool.emplace_back();
+        cell.state.store(owner, std::memory_order_release);
+        return &cell;
+    }
+
+    auto allocateImmortalPluginBinding(JsRuntime::State* owner, JsRuntime::State::JsPluginRecord* record)
+            -> JsRuntime::State::PluginBinding* {
+        static std::mutex                                  poolMutex;
+        static std::deque<JsRuntime::State::PluginBinding> pool;
+        std::lock_guard                                    lock(poolMutex);
+        auto&                                              binding = pool.emplace_back();
+        binding.state.store(owner, std::memory_order_release);
+        binding.record.store(record, std::memory_order_release);
+        binding.alive.store(true, std::memory_order_release);
+        return &binding;
+    }
+
+    struct AbandonedV8Handles {
+        v8::Global<v8::Context>                                                                context;
+        v8::Global<v8::Function>                                                               require;
+        v8::Global<v8::Object>                                                                 electron;
+        v8::Global<v8::Object>                                                                 app;
+        v8::Global<v8::Object>                                                                 ipcMain;
+        v8::Global<v8::Object>                                                                 moduleBuiltin;
+        v8::Global<v8::Object>                                                                 moduleCache;
+        v8::Global<v8::Function>                                                               originalModuleLoad;
+        v8::Global<v8::Function>                                                               patchedModuleLoad;
+        v8::Global<v8::Function>                                                               rendererLogListener;
+        v8::Global<v8::Function>                                                               sessionCreatedListener;
+        v8::Global<v8::Function>                                                               appQuitListener;
+        v8::Global<v8::Function>                                                               processTickCallback;
+        std::vector<v8::Global<v8::Object>>                                                    sessions;
+        std::vector<std::unique_ptr<JsRuntime::State::WebRequestHeadersMux>>                   headersMuxes;
+        std::map<std::string, std::unique_ptr<JsRuntime::State::JsPluginRecord>, std::less<>>  records;
+        std::map<std::string, std::shared_ptr<JsRuntime::State::LoaderCallbacks>, std::less<>> loaders;
+        Alka::Dispatcher                                                                       alkaDispatcher;
+    };
+
+} // namespace
+
+JsRuntime::State::State(Callbacks callbacks)
+    : mSelfCell(allocateImmortalSelfCell(this)), mCallbacks(std::move(callbacks)) {}
 
 JsRuntime::State::~State() {
     detach();
+    if (mSelfCell != nullptr) {
+        mSelfCell->state.store(nullptr, std::memory_order_release);
+    }
+    bool needAbandon = false;
+    {
+        std::lock_guard lock(mMutex);
+        needAbandon = mIsolate != nullptr && !isOnMainThread();
+    }
+    if (needAbandon) {
+        abandonHandlesOffThread();
+    }
+}
+
+auto JsRuntime::State::allocatePluginBinding(JsPluginRecord* record) -> PluginBinding* {
+    auto*           binding = allocateImmortalPluginBinding(this, record);
+    std::lock_guard lock(mMutex);
+    mBindings.push_back(binding);
+    return binding;
 }
 
 bool JsRuntime::State::isAttached() const {
     std::lock_guard lock(mMutex);
-    return mIsolate != nullptr;
+    return mIsolate != nullptr && !mDetaching;
+}
+
+bool JsRuntime::State::isOnMainThread() const noexcept {
+    const uv_thread_t self = uv_thread_self();
+    return uv_thread_equal(&self, &mMainThread) != 0;
 }
 
 void JsRuntime::State::attach(node::Environment*           env,
@@ -45,6 +125,9 @@ void JsRuntime::State::attach(node::Environment*           env,
         if (mAttached) {
             return;
         }
+        if (mSelfCell != nullptr) {
+            mSelfCell->state.store(this, std::memory_order_release);
+        }
         mDetaching = false;
         mEnv       = env;
         mIsolate   = isolate;
@@ -57,8 +140,8 @@ void JsRuntime::State::attach(node::Environment*           env,
         mAttached   = true;
     }
 
-    if (!mAsyncInited) {
-        if (auto* loop = node::GetCurrentEventLoop(isolate); loop != nullptr) {
+    if (auto* loop = node::GetCurrentEventLoop(isolate); loop != nullptr) {
+        if (!mAsyncInited) {
             auto* handle = new uv_async_t{};
             handle->data = this;
             if (uv_async_init(loop, handle, &State::onLifecycleAsync) == 0) {
@@ -70,35 +153,183 @@ void JsRuntime::State::attach(node::Environment*           env,
                 logger().error("JsRuntime::attach: uv_async_init failed; lifecycle dispatch is disabled");
             }
         }
-    }
 
-    if (!mEventChannel) {
-        if (auto* loop = node::GetCurrentEventLoop(isolate); loop != nullptr) {
-            auto channel        = std::make_shared<bridge::JsEventChannel>();
-            channel->isolate    = isolate;
-            channel->mainThread = mMainThread;
-            channel->state      = this;
-            auto* handle        = new uv_async_t{};
-            handle->data        = this;
-            if (uv_async_init(loop, handle, &State::onEventAsync) == 0) {
-                channel->async = handle;
-                std::lock_guard lock(mMutex);
-                mEventAsync       = handle;
-                mEventAsyncInited = true;
-                mEventChannel     = std::move(channel);
+        if (!mAlkaAsyncInited) {
+            auto* alkaHandle = new uv_async_t{};
+            alkaHandle->data = this;
+            if (uv_async_init(loop, alkaHandle, &State::onAlkaAsync) == 0) {
+                uv_unref(reinterpret_cast<uv_handle_t*>(alkaHandle));
+                {
+                    std::lock_guard lock(mMutex);
+                    mAlkaAsync       = alkaHandle;
+                    mAlkaAsyncInited = true;
+                    mAlkaReferenced  = false;
+                    mAlkaDispatcher  = Alka::Dispatcher(isolate);
+                }
+                auto* const selfCell = mSelfCell;
+                mAlkaDispatcher.setWakeup([alkaHandle]() noexcept { (void) uv_async_send(alkaHandle); });
+                mAlkaDispatcher.setActivityHook([selfCell, alkaHandle]() noexcept {
+                    auto* live = selfCell != nullptr ? selfCell->state.load(std::memory_order_acquire) : nullptr;
+                    if (live == nullptr) {
+                        return;
+                    }
+                    if (live->isOnMainThread()) {
+                        live->syncAlkaLoopRef();
+                    } else {
+                        (void) uv_async_send(alkaHandle);
+                    }
+                });
             } else {
-                delete handle;
-                logger().error("JsRuntime::attach: uv_async_init failed; C++->JS event delivery is disabled");
+                delete alkaHandle;
+                logger().error("JsRuntime::attach: uv_async_init failed for AlkaLoopBridge");
             }
         }
     }
 
     bridge::ensureAlkaClasses(isolate);
 
-    node::AddLinkedBinding(env, "clovernt", &bridge::LinkedBinding::registerBinding, this);
+    node::AddLinkedBinding(env, "clovernt", &bridge::LinkedBinding::registerBinding, mSelfCell);
 
     bridge::Clovernt::install(*this);
     bridge::ElectronRuntime::installDetection(*this);
+}
+
+void JsRuntime::State::onAlkaAsync(uv_async_t* handle) {
+    auto* self = static_cast<State*>(handle != nullptr ? handle->data : nullptr);
+    if (self == nullptr) {
+        return;
+    }
+    v8::Isolate*     isolate = nullptr;
+    Alka::Dispatcher dispatcher;
+    {
+        std::lock_guard lock(self->mMutex);
+        if (self->mIsolate == nullptr || self->mDetaching || self->mContext.IsEmpty()) {
+            return;
+        }
+        isolate    = self->mIsolate;
+        dispatcher = self->mAlkaDispatcher;
+    }
+    const v8::Isolate::Scope isolateScope(isolate);
+    const v8::HandleScope    handleScope(isolate);
+    const auto               context = self->mContext.Get(isolate);
+    const v8::Context::Scope contextScope(context);
+
+    (void) dispatcher.drain();
+    self->tickCallback();
+    self->syncAlkaLoopRef();
+}
+
+void JsRuntime::State::syncAlkaLoopRef() noexcept {
+    std::lock_guard lock(mMutex);
+    if (!mAlkaAsyncInited || mAlkaAsync == nullptr || mDetaching) {
+        return;
+    }
+    const bool wantRef = mAlkaDispatcher.busy();
+    if (wantRef == mAlkaReferenced) {
+        return;
+    }
+    mAlkaReferenced = wantRef;
+    auto* raw       = reinterpret_cast<uv_handle_t*>(mAlkaAsync);
+    if (wantRef) {
+        uv_ref(raw);
+    } else {
+        uv_unref(raw);
+    }
+}
+
+void JsRuntime::State::trackJsSubscription(const CloverNT::Event::SubscriptionId id) {
+    if (id == CloverNT::Event::kInvalidSubscriptionId) {
+        return;
+    }
+    std::lock_guard lock(mJsSubMutex);
+    mJsEventSubIds.insert(id);
+}
+
+void JsRuntime::State::untrackJsSubscription(const CloverNT::Event::SubscriptionId id) noexcept {
+    std::lock_guard lock(mJsSubMutex);
+    mJsEventSubIds.erase(id);
+}
+
+void JsRuntime::State::clearAllJsSubscriptions() noexcept {
+    std::vector<CloverNT::Event::SubscriptionId> ids;
+    {
+        std::lock_guard lock(mJsSubMutex);
+        ids.assign(mJsEventSubIds.begin(), mJsEventSubIds.end());
+        mJsEventSubIds.clear();
+    }
+    for (const auto id: ids) {
+        (void) CloverNT::Event::EventBus::off(id);
+    }
+}
+
+void JsRuntime::State::abandonHandlesOffThread() noexcept {
+    std::vector<std::string> loaderIds;
+    std::vector<std::string> pluginNames;
+    {
+        std::lock_guard lock(mMutex);
+        if (mAlkaDispatcher) {
+            mAlkaDispatcher.setActivityHook({});
+            mAlkaDispatcher.setWakeup({});
+        }
+        if (mLifecycleAsync != nullptr) {
+            mLifecycleAsync->data = nullptr;
+            mLifecycleAsync       = nullptr;
+            mAsyncInited          = false;
+        }
+        if (mAlkaAsync != nullptr) {
+            mAlkaAsync->data = nullptr;
+            mAlkaAsync       = nullptr;
+            mAlkaAsyncInited = false;
+            mAlkaReferenced  = false;
+        }
+        for (auto* binding: mBindings) {
+            if (binding != nullptr) {
+                binding->alive.store(false, std::memory_order_release);
+                binding->record.store(nullptr, std::memory_order_release);
+                binding->state.store(nullptr, std::memory_order_release);
+            }
+        }
+        mBindings.clear();
+        for (const auto& name: mRecords | std::views::keys) {
+            pluginNames.push_back(name);
+        }
+        for (const auto& id: mLoaders | std::views::keys) {
+            loaderIds.push_back(id);
+        }
+
+        auto* leaked                   = new AbandonedV8Handles{};
+        leaked->context                = std::move(mContext);
+        leaked->require                = std::move(mRequire);
+        leaked->electron               = std::move(mElectron);
+        leaked->app                    = std::move(mApp);
+        leaked->ipcMain                = std::move(mIpcMain);
+        leaked->moduleBuiltin          = std::move(mModuleBuiltin);
+        leaked->moduleCache            = std::move(mModuleCache);
+        leaked->originalModuleLoad     = std::move(mOriginalModuleLoad);
+        leaked->patchedModuleLoad      = std::move(mPatchedModuleLoad);
+        leaked->rendererLogListener    = std::move(mRendererLogListener);
+        leaked->sessionCreatedListener = std::move(mSessionCreatedListener);
+        leaked->appQuitListener        = std::move(mAppQuitListener);
+        leaked->processTickCallback    = std::move(mProcessTickCallback);
+        leaked->sessions               = std::move(mSessions);
+        leaked->headersMuxes           = std::move(mHeadersMuxes);
+        leaked->records                = std::move(mRecords);
+        leaked->loaders                = std::move(mLoaders);
+        leaked->alkaDispatcher         = std::move(mAlkaDispatcher);
+
+        mEnv      = nullptr;
+        mIsolate  = nullptr;
+        mAttached = false;
+    }
+
+    clearAllJsSubscriptions();
+    for (const auto& name: pluginNames) {
+        (void) CloverNT::Event::EventBus::clearPlugin(name);
+    }
+    for (const auto& id: loaderIds) {
+        (void) Plugin::PluginManager::unregisterLoader(id);
+    }
+    bridge::clearBindings(*this);
 }
 
 void JsRuntime::State::detach() {
@@ -110,8 +341,33 @@ void JsRuntime::State::detach() {
         mDetaching = true;
     }
 
-    if (const uv_thread_t self = uv_thread_self(); uv_thread_equal(&self, &mMainThread) == 0) {
-        logger().error("JsRuntime::detach called off the JS main thread; skipping unsafe teardown");
+    if (!isOnMainThread()) {
+        if (mSelfCell != nullptr) {
+            mSelfCell->state.store(nullptr, std::memory_order_release);
+        }
+        {
+            std::lock_guard lock(mMutex);
+            if (mAlkaDispatcher) {
+                mAlkaDispatcher.setActivityHook({});
+                mAlkaDispatcher.setWakeup({});
+            }
+            if (mLifecycleAsync != nullptr) {
+                mLifecycleAsync->data = nullptr;
+            }
+            if (mAlkaAsync != nullptr) {
+                mAlkaAsync->data = nullptr;
+            }
+            for (auto* binding: mBindings) {
+                if (binding != nullptr) {
+                    binding->alive.store(false, std::memory_order_release);
+                    binding->record.store(nullptr, std::memory_order_release);
+                    binding->state.store(nullptr, std::memory_order_release);
+                }
+            }
+        }
+        clearAllJsSubscriptions();
+        logger().error(
+                "JsRuntime::detach called off the JS main thread; neutralized callbacks and deferred V8 teardown");
         drainLifecycleQueue(jsError("JS runtime detached", CommonErrorCode::Inactive));
         return;
     }
@@ -121,6 +377,7 @@ void JsRuntime::State::detach() {
     {
         std::lock_guard lock(mMutex);
         if (mAsyncInited && mLifecycleAsync != nullptr) {
+            mLifecycleAsync->data = nullptr;
             uv_close(reinterpret_cast<uv_handle_t*>(mLifecycleAsync),
                      [](uv_handle_t* handle) { delete reinterpret_cast<uv_async_t*>(handle); });
             mLifecycleAsync = nullptr;
@@ -164,48 +421,132 @@ auto JsRuntime::State::reloadPlugin(const std::string_view name) -> Expected<voi
 }
 
 void JsRuntime::State::detachState() {
+    std::vector<std::string> remainingPlugins;
+    std::vector<std::string> loaderIds;
+    {
+        std::lock_guard lock(mMutex);
+        for (const auto& name: mRecords | std::views::keys) {
+            remainingPlugins.push_back(name);
+        }
+        for (const auto& id: mLoaders | std::views::keys) {
+            loaderIds.push_back(id);
+        }
+    }
+
+    for (const auto& name: std::views::reverse(remainingPlugins)) {
+        (void) bridge::PluginLifecycle::unload(*this, name);
+    }
+    for (const auto& id: loaderIds) {
+        (void) Plugin::PluginManager::unregisterLoader(id);
+    }
+
     std::lock_guard lock(mMutex);
 
-    if (mEventChannel) {
-        uv_async_t* eventHandle = nullptr;
-        {
-            const std::lock_guard channelLock(mEventChannel->mutex);
-            mEventChannel->alive.store(false, std::memory_order_release);
-            eventHandle          = mEventChannel->async;
-            mEventChannel->async = nullptr;
+    if (mSelfCell != nullptr) {
+        mSelfCell->state.store(nullptr, std::memory_order_release);
+    }
+
+    if (mAlkaDispatcher) {
+        mAlkaDispatcher.setActivityHook({});
+        mAlkaDispatcher.setWakeup({});
+    }
+    clearAllJsSubscriptions();
+
+    if (mIsolate != nullptr && !mContext.IsEmpty()) {
+        const v8::Isolate::Scope isolateScope(mIsolate);
+        const v8::HandleScope    handleScope(mIsolate);
+        const auto               context = mContext.Get(mIsolate);
+        const v8::Context::Scope contextScope(context);
+        const v8::TryCatch       tryCatch(mIsolate);
+
+        if (mModuleLoadPatched && !mModuleBuiltin.IsEmpty() && !mOriginalModuleLoad.IsEmpty()) {
+            const auto mod     = mModuleBuiltin.Get(mIsolate);
+            const auto curLoad = getProp(context, mod, "_load");
+            if (!curLoad.IsEmpty() && !mPatchedModuleLoad.IsEmpty() &&
+                curLoad->StrictEquals(mPatchedModuleLoad.Get(mIsolate))) {
+                (void) mod->Set(context, v8Str(mIsolate, "_load"), mOriginalModuleLoad.Get(mIsolate));
+            }
         }
-        clearEventSubscriptions();
-        if (eventHandle != nullptr) {
-            uv_close(reinterpret_cast<uv_handle_t*>(eventHandle),
-                     [](uv_handle_t* handle) { delete reinterpret_cast<uv_async_t*>(handle); });
+
+        if (!bridge::CloverContext::isShuttingDown()) {
+            if (!mIpcMain.IsEmpty()) {
+                const auto ipc = mIpcMain.Get(mIsolate);
+                if (!mRendererLogListener.IsEmpty()) {
+                    invokeMethod(context,
+                                 ipc,
+                                 "removeListener",
+                                 {v8Str(mIsolate, "clovernt:log"), mRendererLogListener.Get(mIsolate)});
+                }
+                if (mRendererEntriesHandled) {
+                    invokeMethod(context, ipc, "removeHandler", {v8Str(mIsolate, "clovernt:renderer-entries")});
+                }
+            }
+            if (!mApp.IsEmpty()) {
+                const auto app = mApp.Get(mIsolate);
+                if (!mSessionCreatedListener.IsEmpty()) {
+                    invokeMethod(context,
+                                 app,
+                                 "removeListener",
+                                 {v8Str(mIsolate, "session-created"), mSessionCreatedListener.Get(mIsolate)});
+                }
+                if (!mAppQuitListener.IsEmpty()) {
+                    invokeMethod(
+                            context, app, "removeListener", {v8Str(mIsolate, "quit"), mAppQuitListener.Get(mIsolate)});
+                }
+            }
+            for (auto& session: mSessions) {
+                if (!session.IsEmpty()) {
+                    unregisterPreloadOn(context, session.Get(mIsolate), "clovernt-framework");
+                }
+            }
+            for (auto& mux: mHeadersMuxes) {
+                if (mux && !mux->webRequest.IsEmpty()) {
+                    invokeMethod(context, mux->webRequest.Get(mIsolate), "onHeadersReceived", {v8::Null(mIsolate)});
+                }
+            }
         }
-        mEventAsync       = nullptr;
-        mEventAsyncInited = false;
-        mEventChannel.reset();
+
+        (void) context->Global()->Delete(context, v8Str(mIsolate, "clovernt"));
     }
 
     if (mIsolate != nullptr) {
+        bridge::disposeReflectIsolate(mIsolate);
         Alka::disposeIsolate(mIsolate);
     }
+    mAlkaDispatcher = Alka::Dispatcher{};
+
+    if (mAlkaAsyncInited && mAlkaAsync != nullptr) {
+        mAlkaAsync->data = nullptr;
+        uv_close(reinterpret_cast<uv_handle_t*>(mAlkaAsync),
+                 [](uv_handle_t* handle) { delete reinterpret_cast<uv_async_t*>(handle); });
+        mAlkaAsync       = nullptr;
+        mAlkaAsyncInited = false;
+        mAlkaReferenced  = false;
+    }
+
     bridge::clearBindings(*this);
     mEnv     = nullptr;
     mIsolate = nullptr;
     mContext.Reset();
     mRequire.Reset();
-    for (auto& [load, unload, reload]: mLoaders | std::views::values) {
-        load.Reset();
-        unload.Reset();
-        reload.Reset();
+    for (auto& cb: mLoaders | std::views::values) {
+        if (cb) {
+            cb->load.Reset();
+            cb->unload.Reset();
+            cb->reload.Reset();
+        }
     }
     mLoaders.clear();
 
-    for (auto& binding: mBindings) {
-        if (binding) {
-            binding->alive.store(false);
-            binding->record = nullptr;
+    for (auto* binding: mBindings) {
+        if (binding != nullptr) {
+            binding->alive.store(false, std::memory_order_release);
+            binding->record.store(nullptr, std::memory_order_release);
+            binding->state.store(nullptr, std::memory_order_release);
         }
     }
     mBindings.clear();
+    mHeadersMuxes.clear();
     mRecords.clear();
     for (auto& session: mSessions) {
         session.Reset();
@@ -217,6 +558,12 @@ void JsRuntime::State::detachState() {
     mModuleBuiltin.Reset();
     mModuleCache.Reset();
     mOriginalModuleLoad.Reset();
+    mPatchedModuleLoad.Reset();
+    mModuleLoadPatched = false;
+    mRendererLogListener.Reset();
+    mSessionCreatedListener.Reset();
+    mAppQuitListener.Reset();
+    mRendererEntriesHandled = false;
     mProcessTickCallback.Reset();
     mElectronReady = false;
 
@@ -232,10 +579,11 @@ auto JsRuntime::State::callHandler(const v8::Global<v8::Function>& handler, cons
     if (isolate == nullptr || handler.IsEmpty()) {
         return jsError("JS lifecycle handler is not available", CommonErrorCode::Inactive);
     }
-    v8::HandleScope    handleScope(isolate);
-    const auto         context = mContext.Get(isolate);
-    v8::Context::Scope contextScope(context);
-    const v8::TryCatch tryCatch(isolate);
+    const v8::Isolate::Scope isolateScope(isolate);
+    const v8::HandleScope    handleScope(isolate);
+    const auto               context = mContext.Get(isolate);
+    const v8::Context::Scope contextScope(context);
+    const v8::TryCatch       tryCatch(isolate);
 
     v8::Local<v8::String> nameValue;
     if (!v8::String::NewFromUtf8(isolate, name.data(), v8::NewStringType::kNormal, static_cast<int>(name.size()))
@@ -245,8 +593,11 @@ auto JsRuntime::State::callHandler(const v8::Global<v8::Function>& handler, cons
     v8::Local<v8::Value> args[] = {nameValue};
     v8::Local<v8::Value> resultValue;
     if (!handler.Get(isolate)->Call(context, context->Global(), 1, args).ToLocal(&resultValue)) {
-        return jsError("lifecycle handler threw: " + describeException(isolate, context, tryCatch),
-                       CommonErrorCode::CallbackFailed);
+        if (tryCatch.HasCaught()) {
+            logger().error(
+                    "Plugin '{}' lifecycle handler threw: {}", name, describeException(isolate, context, tryCatch));
+        }
+        return jsError(extractExceptionMessage(isolate, context, tryCatch), CommonErrorCode::CallbackFailed);
     }
     if (!resultValue->IsObject()) {
         return {};
@@ -262,9 +613,9 @@ auto JsRuntime::State::callHandler(const v8::Global<v8::Function>& handler, cons
     v8::Local<v8::Value> errorValue;
     if (resultObject->Get(context, v8::String::NewFromUtf8Literal(isolate, "error")).ToLocal(&errorValue) &&
         !errorValue->IsUndefined() && !errorValue->IsNull()) {
-        message = toUtf8(isolate, errorValue);
+        message = extractValueErrorMessage(isolate, context, errorValue);
     }
-    return jsError(message.empty() ? "lifecycle handler reported failure" : message, CommonErrorCode::CallbackFailed);
+    return jsError(message.empty() ? "lifecycle handler failed" : message, CommonErrorCode::CallbackFailed);
 }
 
 auto JsRuntime::State::dispatchLifecycle(const LifecycleOp op, const std::string_view name) -> Expected<void> {
@@ -294,18 +645,20 @@ auto JsRuntime::State::dispatchLifecycle(const LifecycleOp op, const std::string
 }
 
 auto JsRuntime::State::runLifecycle(const LifecycleOp op, const std::string_view name) -> Expected<void> {
+    v8::Isolate* isolate = nullptr;
     {
         std::lock_guard lock(mMutex);
         if (mIsolate == nullptr || !mAsyncInited || mDetaching) {
             return jsError("JS runtime is not attached", CommonErrorCode::Inactive);
         }
+        isolate = mIsolate;
     }
-    const uv_thread_t self = uv_thread_self();
-    if (uv_thread_equal(&self, &mMainThread) != 0) {
+    if (isOnMainThread()) {
+        const v8::Isolate::Scope isolateScope(isolate);
         return dispatchLifecycle(op, name);
     }
 
-    PendingOp pending{op, std::string(name), {}};
+    PendingOp pending{.kind = op, .name = std::string(name), .promise = {}};
     auto      future = pending.promise.get_future();
     {
         std::lock_guard lock(mMutex);
@@ -375,30 +728,30 @@ void JsRuntime::State::registerLoaderCallbacks(std::string id, const v8::Local<v
     if (isolate == nullptr) {
         return;
     }
-    const auto      context = isolate->GetCurrentContext();
-    LoaderCallbacks callbacks;
-    const auto      store = [&](const char* key, v8::Global<v8::Function>& slot) {
+    const auto context   = isolate->GetCurrentContext();
+    auto       callbacks = std::make_shared<LoaderCallbacks>();
+    const auto store     = [&](const char* key, v8::Global<v8::Function>& slot) {
         v8::Local<v8::Value> value;
         if (config->Get(context, v8::String::NewFromUtf8(isolate, key).ToLocalChecked()).ToLocal(&value) &&
             value->IsFunction()) {
             slot.Reset(isolate, value.As<v8::Function>());
         }
     };
-    store("load", callbacks.load);
-    store("unload", callbacks.unload);
-    store("reload", callbacks.reload);
+    store("load", callbacks->load);
+    store("unload", callbacks->unload);
+    store("reload", callbacks->reload);
 
     std::lock_guard lock(mMutex);
     mLoaders[std::move(id)] = std::move(callbacks);
 }
 
 void JsRuntime::State::unregisterLoaderCallbacks(const std::string_view id) {
-    std::lock_guard lock(mMutex);
-    if (const auto it = mLoaders.find(id); it != mLoaders.end()) {
-        it->second.load.Reset();
-        it->second.unload.Reset();
-        it->second.reload.Reset();
-        mLoaders.erase(it);
+    {
+        std::lock_guard lock(mMutex);
+        if (const auto it = mLoaders.find(id); it != mLoaders.end()) {
+            std::shared_ptr<LoaderCallbacks> removed = std::move(it->second);
+            mLoaders.erase(it);
+        }
     }
 }
 
@@ -411,17 +764,17 @@ auto JsRuntime::State::loaderLifecycle(const std::string_view id,
             return jsError("JS runtime is not attached", CommonErrorCode::Inactive);
         }
     }
-    if (const uv_thread_t self = uv_thread_self(); uv_thread_equal(&self, &mMainThread) == 0) {
+    if (!isOnMainThread()) {
         return jsError("loader lifecycle must run on the JS main thread", CommonErrorCode::Inactive);
     }
-    const LoaderCallbacks* cb = nullptr;
+    std::shared_ptr<LoaderCallbacks> cb;
     {
         std::lock_guard lock(mMutex);
         const auto      it = mLoaders.find(id);
-        if (it == mLoaders.end()) {
+        if (it == mLoaders.end() || !it->second) {
             return jsError("loader not registered: " + std::string(id), CommonErrorCode::NotFound);
         }
-        cb = &it->second;
+        cb = it->second;
     }
     const v8::Global<v8::Function>& handler = op == LifecycleOp::Load     ? cb->load
                                               : op == LifecycleOp::Unload ? cb->unload
@@ -429,26 +782,24 @@ auto JsRuntime::State::loaderLifecycle(const std::string_view id,
     return callHandler(handler, name);
 }
 
-void JsRuntime::State::runEventLoopOnce() const {
+int JsRuntime::State::runEventLoopOnce() const {
     v8::Isolate* isolate = nullptr;
     {
         std::lock_guard lock(mMutex);
         isolate = mIsolate;
     }
-    if (isolate == nullptr) {
-        return;
-    }
-    if (const uv_thread_t self = uv_thread_self(); uv_thread_equal(&self, &mMainThread) == 0) {
-        return;
+    if (isolate == nullptr || !isOnMainThread()) {
+        return 0;
     }
     if (auto* loop = node::GetCurrentEventLoop(isolate); loop != nullptr) {
-        uv_run(loop, UV_RUN_ONCE);
+        return uv_run(loop, UV_RUN_ONCE);
     }
+    return 0;
 }
 
 auto JsRuntime::State::requireModule(const v8::Local<v8::Context> context, const std::string& path) const
         -> v8::MaybeLocal<v8::Value> {
-    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    v8::Isolate* isolate = mIsolate != nullptr ? mIsolate : v8::Isolate::GetCurrent();
     if (mRequire.IsEmpty()) {
         return {};
     }
@@ -481,39 +832,42 @@ auto JsRuntime::State::requireModule(const v8::Local<v8::Context> context, const
         !userRequireValue->IsFunction()) {
         return {};
     }
-    // userRequire(entry) -> plugin exports (may throw; caller's TryCatch observes it)
+    // userRequire(entry) -> plugin exports (may throw)
     v8::Local<v8::Value> entryArgs[] = {pathValue};
     return userRequireValue.As<v8::Function>()->Call(context, context->Global(), 1, entryArgs);
 }
 
 v8::Local<v8::Value> JsRuntime::State::buildPluginInfoArray(const v8::Local<v8::Context> context) const {
-    v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    const auto   array   = v8::Array::New(isolate);
+    v8::Isolate* isolate = mIsolate != nullptr ? mIsolate : v8::Isolate::GetCurrent();
 
     std::vector<std::shared_ptr<Plugin::JsPlugin>> snapshot;
     {
         std::lock_guard lock(mMutex);
         snapshot = mQueue;
     }
-    std::uint32_t index = 0;
+
+    std::vector<bridge::PluginListDto> dtos;
+    dtos.reserve(snapshot.size());
     for (auto const& plugin: snapshot) {
         if (!plugin) {
             continue;
         }
-        const auto entry = v8::Object::New(isolate);
-        setProp(context, entry, "name", v8Str(isolate, plugin->name()));
+        bridge::PluginListDto dto;
+        dto.name = std::string(plugin->name());
         if (plugin->mainEntry()) {
-            setProp(context, entry, "main", v8Str(isolate, plugin->mainEntry()->string()));
+            dto.main = plugin->mainEntry()->string();
         }
         if (plugin->preloadEntry()) {
-            setProp(context, entry, "preload", v8Str(isolate, plugin->preloadEntry()->string()));
+            dto.preload = plugin->preloadEntry()->string();
         }
         if (plugin->rendererEntry()) {
-            setProp(context, entry, "renderer", v8Str(isolate, plugin->rendererEntry()->string()));
+            dto.renderer = plugin->rendererEntry()->string();
         }
-        (void) array->Set(context, index++, entry);
+        dtos.push_back(std::move(dto));
     }
-    return array;
+
+    Alka::ConvertCtx cx{isolate, context};
+    return Alka::toJs(cx, dtos);
 }
 
 void JsRuntime::State::tickCallback() {
@@ -566,9 +920,12 @@ void JsRuntime::State::reloadAllWindows() const {
     if (isolate == nullptr || mElectron.IsEmpty()) {
         return;
     }
-    const auto         context = mContext.Get(isolate);
-    const v8::TryCatch tryCatch(isolate);
-    const auto         webContentsVal = getProp(context, mElectron.Get(isolate), "webContents");
+    const v8::Isolate::Scope isolateScope(isolate);
+    const v8::HandleScope    handleScope(isolate);
+    const auto               context = mContext.Get(isolate);
+    const v8::Context::Scope contextScope(context);
+    const v8::TryCatch       tryCatch(isolate);
+    const auto               webContentsVal = getProp(context, mElectron.Get(isolate), "webContents");
     if (webContentsVal.IsEmpty() || !webContentsVal->IsObject()) {
         return;
     }

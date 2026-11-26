@@ -70,11 +70,15 @@ jobs:
           export SDK_REMOTE="git@github.com:${SDK_REPO}.git"
           export SDK_PKG_DIR=sdk-package
           if [ "$GITHUB_REF_TYPE" = tag ]; then
-              export SDK_BRANCH=main SDK_TAG="$GITHUB_REF_NAME"
+              export SDK_TAG="$GITHUB_REF_NAME"
+              if [[ "$GITHUB_REF_NAME" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  export SDK_BRANCH=main
+              else
+                  export SDK_BRANCH=dev
+              fi
           else
               export SDK_BRANCH=dev
           fi
-          export SDK_COMMIT_MESSAGE="CloverCore $SDK_VERSION ($CORE_SHA)
-
-          Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
+          export SDK_COMMIT_MESSAGE="$(printf 'CloverCore %s (%s)\n\nSource: %s/%s/commit/%s' \
+              "$SDK_VERSION" "$CORE_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SHA")"
           bash .github/scripts/publish-sdk.sh

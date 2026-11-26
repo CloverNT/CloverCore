@@ -7,8 +7,8 @@
 #include <CloverNT/Runtime/Nt.h>
 
 #include <atomic>
-#include <array>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -16,16 +16,15 @@
 #include <string_view>
 #include <thread>
 #include <utility>
-#include <vector>
 
 #if defined(_MSC_VER)
-    #define CLOVER_GUARD_NOINLINE __declspec(noinline)
+#define CLOVER_GUARD_NOINLINE __declspec(noinline)
 #else
-    #define CLOVER_GUARD_NOINLINE __attribute__((noinline))
+#define CLOVER_GUARD_NOINLINE __attribute__((noinline))
 #endif
 
 #ifndef CLOVERNT_VERSION_FULL
-    #define CLOVERNT_VERSION_FULL "0.0.0-unknown"
+#define CLOVERNT_VERSION_FULL "0.0.0-unknown"
 #endif
 
 namespace CloverNT::Core::Modules::bridge {
@@ -61,8 +60,6 @@ namespace {
         return fn;
     }
 
-    // Must remain a non-inlined function inside CloverCore so CloverLoader's RtlCaptureStackBackTrace /
-    // backtrace identifies CloverCore as the immediate external caller frame.
     CLOVER_GUARD_NOINLINE auto callLoaderGuardSetLocked(const std::uint32_t families, const CloverBool locked) noexcept
             -> GuardCallOutcome {
         const auto fn = resolveGuardSetLocked();
@@ -73,107 +70,32 @@ namespace {
         return {.status = status, .lockedMask = currentGuardMask()};
     }
 
-    struct GuardAsyncTask {
-        std::mutex                        mutex;
-        JsRuntime::State*                 state{};
-        v8::Isolate*                      isolate{};
-        v8::Global<v8::Context>           context;
-        v8::Global<v8::Promise::Resolver> resolver;
-        uv_async_t*                       async{};
-        bool                              alive{true};
-        std::uint32_t                     families{};
-        CloverBool                        locked{};
-        std::int32_t                      status{kGuardStatusUnavailable};
-        std::optional<std::uint32_t>      lockedMask;
-    };
-
-    std::mutex                                      gPendingGuardMutex;
-    std::vector<std::shared_ptr<GuardAsyncTask>>    gPendingGuardTasks;
-
-    void closeGuardAsyncHandle(uv_async_t* handle) noexcept {
-        if (handle == nullptr) {
-            return;
-        }
-        uv_close(reinterpret_cast<uv_handle_t*>(handle), [](uv_handle_t* h) {
-            delete static_cast<std::shared_ptr<GuardAsyncTask>*>(h->data);
-            delete reinterpret_cast<uv_async_t*>(h);
-        });
-    }
-
-    auto makeGuardResultObject(v8::Isolate*                        isolate,
-                               const v8::Local<v8::Context>        context,
-                               const std::int32_t                  status,
-                               const std::optional<std::uint32_t>& lockedMask) -> v8::Local<v8::Object> {
-        const auto obj = v8::Object::New(isolate);
-        setProp(context, obj, "status", v8::Integer::New(isolate, status));
+    [[nodiscard]] auto makeGuardSetResultDto(const std::int32_t                  status,
+                                             const std::optional<std::uint32_t>& lockedMask) noexcept
+            -> GuardSetResultDto {
+        GuardSetResultDto dto{.status = status, .lockedMask = nullptr};
         if (lockedMask.has_value()) {
-            setProp(context, obj, "lockedMask", v8::Integer::NewFromUnsigned(isolate, *lockedMask));
-        } else {
-            setProp(context, obj, "lockedMask", v8::Null(isolate));
+            dto.lockedMask = *lockedMask;
         }
-        return obj;
-    }
-
-    void onGuardAsyncDone(uv_async_t* handle) {
-        auto* holder = static_cast<std::shared_ptr<GuardAsyncTask>*>(handle->data);
-        if (holder == nullptr || !*holder) {
-            return;
-        }
-        const auto task = *holder;
-
-        v8::Isolate*                      isolate = nullptr;
-        v8::Global<v8::Context>           ctxGlobal;
-        v8::Global<v8::Promise::Resolver> resolverGlobal;
-        std::int32_t                      status = kGuardStatusUnavailable;
-        std::optional<std::uint32_t>      lockedMask;
-        uv_async_t*                       toClose = nullptr;
-        {
-            std::lock_guard lock(task->mutex);
-            if (!task->alive) {
-                return;
-            }
-            task->alive    = false;
-            toClose        = task->async;
-            task->async    = nullptr;
-            isolate        = task->isolate;
-            status         = task->status;
-            lockedMask     = task->lockedMask;
-            ctxGlobal      = std::move(task->context);
-            resolverGlobal = std::move(task->resolver);
-        }
-
-        {
-            std::lock_guard pendingLock(gPendingGuardMutex);
-            std::erase(gPendingGuardTasks, task);
-        }
-
-        if (isolate != nullptr && !ctxGlobal.IsEmpty() && !resolverGlobal.IsEmpty()) {
-            const v8::HandleScope    handleScope(isolate);
-            const auto               context = ctxGlobal.Get(isolate);
-            const v8::Context::Scope contextScope(context);
-            const auto               resultObj = makeGuardResultObject(isolate, context, status, lockedMask);
-            (void) resolverGlobal.Get(isolate)->Resolve(context, resultObj);
-            resolverGlobal.Reset();
-            ctxGlobal.Reset();
-        }
-
-        closeGuardAsyncHandle(toClose);
+        return dto;
     }
 
     std::string loaderVersionString() {
-        return std::string{CloverNT::Runtime::Kernel::selfVersion()};
+        return std::string{Runtime::Kernel::selfVersion()};
     }
+
     std::string qqVersionString() {
-        return std::string{CloverNT::Runtime::Kernel::qqVersion()};
+        return std::string{Runtime::Kernel::qqVersion()};
     }
+
     std::string pluginsDirString() {
-        return std::string{CloverNT::Runtime::Kernel::pluginsDir()};
+        return std::string{Runtime::Kernel::pluginsDir()};
     }
 } // namespace
 
 void Logger::factory(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        if (auto* state = dataOf<JsRuntime::State>(args); state != nullptr) {
+        if (auto* state = stateOf(args); state != nullptr) {
             v8::Isolate*      isolate = args.GetIsolate();
             const std::string scope   = args.Length() > 0 ? toUtf8(isolate, args[0]) : std::string{};
             args.GetReturnValue().Set(create(*state, isolate->GetCurrentContext(), scope));
@@ -183,7 +105,7 @@ void Logger::factory(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
 void Logger::sink(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        auto* state = dataOf<JsRuntime::State>(args);
+        auto* state = stateOf(args);
         if (state == nullptr) {
             return;
         }
@@ -208,8 +130,8 @@ auto PluginManager::instance(JsRuntime::State& state, const v8::Local<v8::Contex
 
 void LinkedBinding::runEventLoopOnce(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        if (const auto* state = dataOf<JsRuntime::State>(args); state != nullptr) {
-            state->runEventLoopOnce();
+        if (const auto* state = stateOf(args); state != nullptr) {
+            (void) state->runEventLoopOnce();
         }
     });
 }
@@ -226,110 +148,37 @@ void LinkedBinding::getGuardLocked(const v8::FunctionCallbackInfo<v8::Value>& ar
 }
 
 void LinkedBinding::setGuardLocked(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    guardedCallback(args, [&] {
-        v8::Isolate*                     isolate = args.GetIsolate();
-        const auto                       context = isolate->GetCurrentContext();
-        v8::Local<v8::Promise::Resolver> resolver;
-        if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
-            return;
-        }
-        args.GetReturnValue().Set(resolver->GetPromise());
+    guardedCallback(args,
+                    [&] {
+                        v8::Isolate*     isolate = args.GetIsolate();
+                        const auto       context = isolate->GetCurrentContext();
+                        Alka::ConvertCtx cx{isolate, context};
 
-        auto*          state    = dataOf<JsRuntime::State>(args);
-        const uint32_t families = args.Length() > 0 ? args[0]->Uint32Value(context).FromMaybe(0u) : 0u;
-        const CloverBool locked = args.Length() > 1 && args[1]->BooleanValue(isolate) ? 1 : 0;
+                        const Alka::Promise<GuardSetResultDto> promise(cx);
+                        if (!promise.valid()) {
+                            return;
+                        }
+                        args.GetReturnValue().Set(Alka::toJs(cx, promise));
 
-        auto* loop = state != nullptr ? node::GetCurrentEventLoop(isolate) : nullptr;
-        if (state == nullptr || loop == nullptr) {
-            (void) resolver->Resolve(
-                    context, makeGuardResultObject(isolate, context, kGuardStatusUnavailable, currentGuardMask()));
-            return;
-        }
+                        const auto*    state    = stateOf(args);
+                        const uint32_t families = args.Length() > 0 ? args[0]->Uint32Value(context).FromMaybe(0u) : 0u;
+                        const CloverBool locked = args.Length() > 1 && args[1]->BooleanValue(isolate) ? 1 : 0;
 
-        auto task      = std::make_shared<GuardAsyncTask>();
-        task->state    = state;
-        task->isolate  = isolate;
-        task->context.Reset(isolate, context);
-        task->resolver.Reset(isolate, resolver);
-        task->families = families;
-        task->locked   = locked;
+                        if (state == nullptr || !state->isAttached()) {
+                            (void) promise.resolve(makeGuardSetResultDto(kGuardStatusUnavailable, currentGuardMask()));
+                            return;
+                        }
 
-        auto* async  = new uv_async_t{};
-        async->data  = new std::shared_ptr<GuardAsyncTask>(task);
-        if (uv_async_init(loop, async, &onGuardAsyncDone) != 0) {
-            delete static_cast<std::shared_ptr<GuardAsyncTask>*>(async->data);
-            delete async;
-            task->resolver.Reset();
-            task->context.Reset();
-            (void) resolver->Resolve(
-                    context, makeGuardResultObject(isolate, context, kGuardStatusUnavailable, currentGuardMask()));
-            return;
-        }
-        task->async = async;
-
-        {
-            std::lock_guard pendingLock(gPendingGuardMutex);
-            gPendingGuardTasks.push_back(task);
-        }
-
+        auto settler = promise.settler();
         try {
-            std::thread([task] {
-                const auto outcome = callLoaderGuardSetLocked(task->families, task->locked);
-                std::lock_guard lock(task->mutex);
-                task->status     = outcome.status;
-                task->lockedMask = outcome.lockedMask;
-                if (task->alive && task->async != nullptr) {
-                    (void) uv_async_send(task->async);
-                }
+            std::thread([settler = std::move(settler), families, locked]() mutable {
+                const auto [status, lockedMask] = callLoaderGuardSetLocked(families, locked);
+                (void) settler.resolve(makeGuardSetResultDto(status, lockedMask));
             }).detach();
         } catch (...) {
-            uv_async_t* toClose = nullptr;
-            {
-                std::lock_guard lock(task->mutex);
-                task->alive = false;
-                toClose     = task->async;
-                task->async = nullptr;
-                task->resolver.Reset();
-                task->context.Reset();
-            }
-            {
-                std::lock_guard pendingLock(gPendingGuardMutex);
-                std::erase(gPendingGuardTasks, task);
-            }
-            closeGuardAsyncHandle(toClose);
-            (void) resolver->Resolve(
-                    context, makeGuardResultObject(isolate, context, kGuardStatusUnavailable, currentGuardMask()));
+            (void) settler.resolve(makeGuardSetResultDto(kGuardStatusUnavailable, currentGuardMask()));
         }
     });
-}
-
-void LinkedBinding::cancelPendingGuardRequests(JsRuntime::State& state) {
-    std::vector<std::shared_ptr<GuardAsyncTask>> toCancel;
-    {
-        std::lock_guard pendingLock(gPendingGuardMutex);
-        for (auto it = gPendingGuardTasks.begin(); it != gPendingGuardTasks.end();) {
-            if (*it && (*it)->state == &state) {
-                toCancel.push_back(std::move(*it));
-                it = gPendingGuardTasks.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    for (const auto& task: toCancel) {
-        uv_async_t* toClose = nullptr;
-        {
-            std::lock_guard lock(task->mutex);
-            if (task->alive) {
-                task->alive = false;
-                toClose     = task->async;
-                task->async = nullptr;
-                task->resolver.Reset();
-                task->context.Reset();
-            }
-        }
-        closeGuardAsyncHandle(toClose);
-    }
 }
 
 void LinkedBinding::registerBinding(const v8::Local<v8::Object>  exports,
@@ -338,7 +187,8 @@ void LinkedBinding::registerBinding(const v8::Local<v8::Object>  exports,
                                     void*                        priv) {
     try {
         (void) module;
-        auto*           state   = static_cast<JsRuntime::State*>(priv);
+        auto*           cell    = static_cast<JsRuntime::State::SelfCell*>(priv);
+        auto*           state   = cell != nullptr ? cell->state.load(std::memory_order_acquire) : nullptr;
         v8::Isolate*    isolate = v8::Isolate::GetCurrent();
         v8::HandleScope scope(isolate);
 
@@ -357,7 +207,7 @@ void LinkedBinding::registerBinding(const v8::Local<v8::Object>  exports,
         }
         setProp(context, exports, "coreDir", v8Str(isolate, coreDir));
 
-        const auto external = v8::External::New(isolate, state);
+        const auto external = v8::External::New(isolate, state->selfCell());
         setProp(context, exports, "log", makeFn(context, &Logger::sink, external));
         setProp(context, exports, "createLogger", makeFn(context, &Logger::factory, external));
         setProp(context, exports, "runEventLoopOnce", makeFn(context, &LinkedBinding::runEventLoopOnce, external));
@@ -380,9 +230,9 @@ namespace {
     };
 } // namespace
 
-auto Deasync::create(JsRuntime::State& state, const v8::Local<v8::Context> context) -> v8::Local<v8::Object> {
+auto Deasync::create(const JsRuntime::State& state, const v8::Local<v8::Context> context) -> v8::Local<v8::Object> {
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    const auto   ext     = v8::External::New(isolate, &state);
+    const auto   ext     = v8::External::New(isolate, state.selfCell());
     const auto   deasync = v8::Object::New(isolate);
     setProp(context, deasync, "loopWhile", makeFn(context, &Deasync::loopWhile, ext));
     setProp(context, deasync, "await", makeFn(context, &Deasync::await, ext));
@@ -391,7 +241,7 @@ auto Deasync::create(JsRuntime::State& state, const v8::Local<v8::Context> conte
 
 void Deasync::loopWhile(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        auto* state = dataOf<JsRuntime::State>(args);
+        auto* state = stateOf(args);
         if (state == nullptr || args.Length() < 1 || !args[0]->IsFunction()) {
             return;
         }
@@ -406,9 +256,17 @@ void Deasync::loopWhile(const v8::FunctionCallbackInfo<v8::Value>& args) {
             return false;
         };
         while (test()) {
+            if (!state->isAttached()) {
+                isolate->ThrowException(v8::Exception::Error(v8Str(isolate, "deasync.loopWhile: JS runtime detached")));
+                return;
+            }
             state->tickCallback();
             if (test()) {
-                state->runEventLoopOnce();
+                if (state->runEventLoopOnce() == 0 && test()) {
+                    isolate->ThrowException(v8::Exception::Error(
+                            v8Str(isolate, "deasync.loopWhile: event loop has no active handles left")));
+                    return;
+                }
             }
         }
     });
@@ -420,8 +278,8 @@ void Deasync::awaitOnOk(const v8::FunctionCallbackInfo<v8::Value>& args) {
         if (holder == nullptr) {
             return;
         }
-        const auto st = *holder; // keep the state alive for this callback
-        delete holder;           // release the heap holder; a settled promise fires once
+        const auto st = *holder;
+        delete holder;
         if (!st) {
             return;
         }
@@ -431,6 +289,7 @@ void Deasync::awaitOnOk(const v8::FunctionCallbackInfo<v8::Value>& args) {
         st->done = true;
     });
 }
+
 void Deasync::awaitOnErr(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
         const auto* holder = dataOf<std::shared_ptr<AwaitState>>(args);
@@ -451,42 +310,63 @@ void Deasync::awaitOnErr(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 void Deasync::await(const v8::FunctionCallbackInfo<v8::Value>& args) {
-    guardedCallback(args, [&] {
-        auto* state = dataOf<JsRuntime::State>(args);
-        if (state == nullptr) {
-            return;
-        }
-        v8::Isolate* isolate = args.GetIsolate();
-        const auto   context = isolate->GetCurrentContext();
+    guardedCallback(args,
+                    [&] {
+                        auto* state = stateOf(args);
+                        if (state == nullptr) {
+                            return;
+                        }
+                        v8::Isolate* isolate = args.GetIsolate();
+                        const auto   context = isolate->GetCurrentContext();
 
-        auto                             st     = std::make_shared<AwaitState>();
-        auto*                            holder = new std::shared_ptr(st);
-        const auto                       ext    = v8::External::New(isolate, holder);
-        const v8::Local<v8::Value>       input  = args.Length() > 0 ? args[0] : v8::Undefined(isolate).As<v8::Value>();
-        v8::Local<v8::Promise::Resolver> resolver;
-        if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
-            delete holder;
-            return;
-        }
-        (void) resolver->Resolve(context, input); // adopts input if it is a thenable/promise
-        const auto promise = resolver->GetPromise();
-        (void) promise->Then(
-                context, makeFn(context, &Deasync::awaitOnOk, ext), makeFn(context, &Deasync::awaitOnErr, ext));
+                        const auto                 st     = std::make_shared<AwaitState>();
+                        auto*                      holder = new std::shared_ptr(st);
+                        const auto                 ext    = v8::External::New(isolate, holder);
+                        const v8::Local<v8::Value> input =
+                                args.Length() > 0 ? args[0] : v8::Undefined(isolate).As<v8::Value>();
+                        v8::Local<v8::Promise::Resolver> resolver;
+                        if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) {
+                            delete holder;
+                            return;
+                        }
+                        if (resolver->Resolve(context, input).IsNothing()) {
+                            delete holder;
+                            return;
+                        }
+                        if (const auto promise = resolver->GetPromise();
+                            promise->Then(context,
+                                          makeFn(context, &Deasync::awaitOnOk, ext),
+                                          makeFn(context, &Deasync::awaitOnErr, ext))
+                                    .IsEmpty()) {
+                            delete holder;
+                            return;
+                        }
 
-        while (!st->done) {
-            state->tickCallback();
-            if (!st->done) {
-                state->runEventLoopOnce();
-            }
-        }
-        if (st->failed) {
-            isolate->ThrowException(st->error.IsEmpty() ? v8::Undefined(isolate).As<v8::Value>()
-                                                        : st->error.Get(isolate));
-            return;
-        }
-        args.GetReturnValue().Set(st->value.IsEmpty() ? v8::Undefined(isolate).As<v8::Value>()
-                                                      : st->value.Get(isolate));
-    });
+                        while (!st->done) {
+                            if (!state->isAttached()) {
+                                isolate->ThrowException(
+                                        v8::Exception::Error(v8Str(isolate, "deasync.await: JS runtime detached")));
+                                return;
+                            }
+                            state->tickCallback();
+                            if (!st->done) {
+                                if (state->runEventLoopOnce() == 0 && !st->done) {
+                                    isolate->ThrowException(
+                                            v8::Exception::Error(v8Str(isolate,
+                                                                       "deasync.await: promise never settled and event "
+                                                                       "loop has no active handles")));
+                                    return;
+                                }
+                            }
+                        }
+                        if (st->failed) {
+                            isolate->ThrowException(st->error.IsEmpty() ? v8::Undefined(isolate).As<v8::Value>()
+                                                                        : st->error.Get(isolate));
+                            return;
+                        }
+                        args.GetReturnValue().Set(st->value.IsEmpty() ? v8::Undefined(isolate).As<v8::Value>()
+                                                                      : st->value.Get(isolate));
+                    });
 }
 
 void Clovernt::install(JsRuntime::State& state) {
@@ -494,15 +374,16 @@ void Clovernt::install(JsRuntime::State& state) {
     if (isolate == nullptr) {
         return;
     }
-    v8::HandleScope    handleScope(isolate);
-    const auto         context = state.mContext.Get(isolate);
-    v8::Context::Scope contextScope(context);
+    const v8::Isolate::Scope isolateScope(isolate);
+    v8::HandleScope          handleScope(isolate);
+    const auto               context = state.mContext.Get(isolate);
+    v8::Context::Scope       contextScope(context);
     (void) context->Global()->Set(context, v8Str(isolate, "clovernt"), create(state, context));
 }
 
 auto Clovernt::create(JsRuntime::State& state, const v8::Local<v8::Context> context) -> v8::Local<v8::Object> {
-    v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    const auto   ext     = v8::External::New(isolate, &state);
+    v8::Isolate* isolate = state.mIsolate != nullptr ? state.mIsolate : v8::Isolate::GetCurrent();
+    const auto   ext     = v8::External::New(isolate, state.selfCell());
     const auto   clover  = v8::Object::New(isolate);
     setProp(context, clover, "version", v8Str(isolate, kCoreVersion));
     setProp(context, clover, "loaderVersion", v8Str(isolate, loaderVersionString()));
@@ -525,10 +406,11 @@ auto Clovernt::create(JsRuntime::State& state, const v8::Local<v8::Context> cont
 
 void pluginsGetter(v8::Local<v8::Name>, const v8::PropertyCallbackInfo<v8::Value>& info) {
     guardedCallback(info, [&] {
-        if (!info.Data()->IsExternal()) {
+        const auto* state = stateOf(info);
+        if (state == nullptr) {
+            info.GetReturnValue().Set(v8::Array::New(info.GetIsolate(), 0));
             return;
         }
-        const auto* state = static_cast<JsRuntime::State*>(info.Data().As<v8::External>()->Value());
         info.GetReturnValue().Set(state->buildPluginInfoArray(info.GetIsolate()->GetCurrentContext()));
     });
 }
@@ -542,6 +424,7 @@ void Clovernt::load(const v8::FunctionCallbackInfo<v8::Value>& args) {
         args.GetReturnValue().Set(Plugin::PluginManager::loadPlugin(toUtf8(args.GetIsolate(), args[0])).has_value());
     });
 }
+
 void Clovernt::unload(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
         if (args.Length() < 1) {
@@ -551,6 +434,7 @@ void Clovernt::unload(const v8::FunctionCallbackInfo<v8::Value>& args) {
         args.GetReturnValue().Set(Plugin::PluginManager::unloadPlugin(toUtf8(args.GetIsolate(), args[0])).has_value());
     });
 }
+
 void Clovernt::reload(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
         if (args.Length() < 1) {
@@ -571,7 +455,7 @@ void Clovernt::rescan(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
 void Clovernt::registerLoader(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        auto* state = dataOf<JsRuntime::State>(args);
+        auto* state = stateOf(args);
         if (state == nullptr || args.Length() < 1 || !args[0]->IsObject()) {
             args.GetReturnValue().Set(false);
             return;
@@ -585,27 +469,29 @@ void Clovernt::registerLoader(const v8::FunctionCallbackInfo<v8::Value>& args) {
             return;
         }
         const std::string id = toUtf8(isolate, idValue);
-        state->registerLoaderCallbacks(id, config);
-        if (const auto result = Plugin::PluginManager::registerLoader(std::make_shared<JsPluginLoader>(state, id));
+        if (const auto result =
+                    Plugin::PluginManager::registerLoader(std::make_shared<JsPluginLoader>(state->selfCell(), id));
             !result) {
-            state->unregisterLoaderCallbacks(id);
             args.GetReturnValue().Set(false);
             return;
         }
+        state->registerLoaderCallbacks(id, config);
         args.GetReturnValue().Set(true);
     });
 }
 
 void Clovernt::unregisterLoader(const v8::FunctionCallbackInfo<v8::Value>& args) {
     guardedCallback(args, [&] {
-        auto* state = dataOf<JsRuntime::State>(args);
+        auto* state = stateOf(args);
         if (state == nullptr || args.Length() < 1 || !args[0]->IsString()) {
             args.GetReturnValue().Set(false);
             return;
         }
         const std::string id     = toUtf8(args.GetIsolate(), args[0]);
         const auto        result = Plugin::PluginManager::unregisterLoader(id);
-        state->unregisterLoaderCallbacks(id);
+        if (result) {
+            state->unregisterLoaderCallbacks(id);
+        }
         args.GetReturnValue().Set(result.has_value());
     });
 }

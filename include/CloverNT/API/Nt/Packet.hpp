@@ -39,41 +39,33 @@
 
 namespace CloverNT::Nt {
 
-/// Raw byte payload.
 using Bytes = std::vector<std::uint8_t>;
 
-/// Encryption applied to an SSO packet body.
 enum class Encryption : std::uint8_t {
-    None    = 0, ///< Plaintext body.
-    D2Key   = 1, ///< Encrypted with the session d2 key.
-    ZeroKey = 2, ///< Encrypted with the zero key (login handshake).
+    None    = 0,
+    D2Key   = 1,
+    ZeroKey = 2,
 };
 
-/// A single SSO packet.
-///
-/// For received packets `body` is the decrypted payload; for outgoing packets it
-/// is the plaintext payload to send.
 struct Packet {
     std::uint32_t seq{};
     std::string   command;
-    std::string   uin; ///< e.g. "10001".
-    std::string   uid; ///< NT account id ("u_...").
+    std::string   uin;
+    std::string   uid;
     Encryption    encryption{Encryption::None};
     Bytes         body;
 
     bool injected{false};
 };
 
-/// A plaintext o3 secure-channel packet.
 struct O3Packet {
     std::string command;
     Bytes       body;
 };
 
-/// The captured session credentials.
 struct Credential {
-    std::string                  uin; ///< Numeric account, e.g. "10001".
-    std::string                  uid; ///< NT account id ("u_...").
+    std::string                  uin;
+    std::string                  uid;
     Bytes                        a2;
     Bytes                        d2;
     std::array<std::uint8_t, 16> d2Key{};
@@ -87,13 +79,10 @@ namespace Events {
     inline constexpr std::string_view kCredential = "packet::credential";
 } // namespace Events
 
-/// Default timeout for the blocking wait helpers.
 inline constexpr std::chrono::milliseconds kDefaultTimeout{5000};
 
 namespace Codec {
 
-    /// Upper bound on any single length field, so a corrupt prefix can't request a
-    /// huge allocation. 64 MiB comfortably exceeds any real SSO/o3 packet.
     inline constexpr std::uint32_t kMaxField = 64u * 1024u * 1024u;
 
     namespace Detail {
@@ -114,7 +103,6 @@ namespace Codec {
             putBytes(out, std::span{reinterpret_cast<const std::uint8_t*>(str.data()), str.size()});
         }
 
-        /// Bounds-checked forward cursor over a borrowed buffer.
         class Reader {
         public:
             explicit Reader(const std::span<const std::uint8_t> data) noexcept : mData(data) {}
@@ -256,8 +244,6 @@ namespace Detail {
                                                            CloverPacketSink,
                                                            void*);
 
-    /// Resolves an optional CloverLoader export at runtime so newer symbols (e.g. `CloverGetLocked`,
-    /// `CloverSetLocked`, `CloverPacketCall`) never become hard dynamic-linker imports on older loaders.
     [[nodiscard]] inline auto resolveLoaderSymbol(const char* const name) noexcept -> void* {
         if (name == nullptr || name[0] == '\0') {
             return nullptr;
@@ -300,72 +286,80 @@ namespace Detail {
     inline void CloverNT_KERNEL_CALL packetSink(const std::uint8_t* const data,
                                                 const std::size_t         len,
                                                 void* const               user) {
-        *static_cast<std::optional<Packet>*>(user) = Codec::decodePacket(std::span{data, len});
+        try {
+            if (user != nullptr) {
+                *static_cast<std::optional<Packet>*>(user) = Codec::decodePacket(std::span{data, len});
+            }
+        } catch (...) {}
     }
 
     inline void CloverNT_KERNEL_CALL credentialSink(const std::uint8_t* const data,
                                                     const std::size_t         len,
                                                     void* const               user) {
-        *static_cast<std::optional<Credential>*>(user) = Codec::decodeCredential(std::span{data, len});
+        try {
+            if (user != nullptr) {
+                *static_cast<std::optional<Credential>*>(user) = Codec::decodeCredential(std::span{data, len});
+            }
+        } catch (...) {}
+    }
+
+    [[nodiscard]] constexpr auto clampTimeoutMs(const std::chrono::milliseconds timeout) noexcept -> std::uint32_t {
+        const auto count = timeout.count();
+        if (count <= 0) {
+            return 0u;
+        }
+        if (count >= static_cast<std::chrono::milliseconds::rep>(UINT32_MAX)) {
+            return UINT32_MAX;
+        }
+        return static_cast<std::uint32_t>(count);
     }
 
 } // namespace Detail
 
-/// Whether the low-level direct send path has been discovered from wrapper.node.
 [[nodiscard]] inline auto ready() -> bool {
     return CloverPacketReady() != 0;
 }
 
-/// Whether the running CloverLoader exports `CloverGetLocked`.
 [[nodiscard]] inline auto guardAvailable() noexcept -> bool {
     return Detail::getLockedFn() != nullptr;
 }
 
-/// Raw status mask from `CloverGetLocked()` (`CLOVER_FAMILY_*` and `CLOVER_PATCHGUARD_NEXT`), or 0 if unsupported.
 [[nodiscard]] inline auto lockedFamilies() -> std::uint32_t {
     const auto fn = Detail::getLockedFn();
     return fn != nullptr ? fn() : 0u;
 }
 
-/// Whether the Packet API family (`CLOVER_FAMILY_PACKET`) is currently locked by ApiGuard.
 [[nodiscard]] inline auto packetLocked() -> bool {
     return (lockedFamilies() & CLOVER_FAMILY_PACKET) != 0;
 }
 
-/// Whether the Credential API family (`CLOVER_FAMILY_CREDENTIAL`) is currently locked by ApiGuard.
 [[nodiscard]] inline auto credentialLocked() -> bool {
     return (lockedFamilies() & CLOVER_FAMILY_CREDENTIAL) != 0;
 }
 
-/// 2-bit PatchGuard state (`CLOVER_PATCHGUARD_ACTIVE` | `CLOVER_PATCHGUARD_ENABLED`).
 [[nodiscard]] inline auto patchGuardState() -> std::uint32_t {
     return CLOVER_PATCHGUARD_STATE(lockedFamilies());
 }
 
-/// Whether PatchGuard integrity checks are active in the current process.
 [[nodiscard]] inline auto patchGuardActive() -> bool {
     return (patchGuardState() & CLOVER_PATCHGUARD_ACTIVE) != 0;
 }
 
-/// Whether PatchGuard is configured to run on the next launch.
 [[nodiscard]] inline auto patchGuardEnabledNext() -> bool {
     return (patchGuardState() & CLOVER_PATCHGUARD_ENABLED) != 0;
 }
 
-/// Whether a PatchGuard configuration change is waiting for a process restart to take effect.
 [[nodiscard]] inline auto patchGuardRestartPending() -> bool {
-    return patchGuardActive() != patchGuardEnabledNext();
+    const auto state = patchGuardState();
+    return ((state & CLOVER_PATCHGUARD_ACTIVE) != 0) != ((state & CLOVER_PATCHGUARD_ENABLED) != 0);
 }
 
-/// The most recently captured session credentials, if any.
 [[nodiscard]] inline auto credential() -> std::optional<Credential> {
     std::optional<Credential> out;
     (void) CloverPacketCredential(&Detail::credentialSink, &out);
     return out;
 }
 
-/// Send a packet (fire-and-forget). Returns the captured sequence id (0 if queued without synchronous sequence capture),
-/// or std::nullopt if sending failed or is locked.
 [[nodiscard]] inline auto send(const std::string_view command, const std::span<const std::uint8_t> body)
         -> std::optional<std::uint32_t> {
     std::uint32_t seq = 0;
@@ -375,24 +369,21 @@ namespace Detail {
     return seq;
 }
 
-/// Wait for the next received packet with the given service command.
 [[nodiscard]] inline auto receive(const std::string_view          command,
                                   const std::chrono::milliseconds timeout = kDefaultTimeout) -> std::optional<Packet> {
     std::optional<Packet> out;
     (void) CloverPacketReceiveByCommand(
-            command.data(), command.size(), static_cast<std::uint32_t>(timeout.count()), &Detail::packetSink, &out);
+            command.data(), command.size(), Detail::clampTimeoutMs(timeout), &Detail::packetSink, &out);
     return out;
 }
 
-/// Wait for the next received packet with the given sequence id.
 [[nodiscard]] inline auto receive(const std::uint32_t seq, const std::chrono::milliseconds timeout = kDefaultTimeout)
         -> std::optional<Packet> {
     std::optional<Packet> out;
-    (void) CloverPacketReceiveBySequence(seq, static_cast<std::uint32_t>(timeout.count()), &Detail::packetSink, &out);
+    (void) CloverPacketReceiveBySequence(seq, Detail::clampTimeoutMs(timeout), &Detail::packetSink, &out);
     return out;
 }
 
-/// Send a packet and wait for its response.
 [[nodiscard]] inline auto call(const std::string_view              command,
                                const std::span<const std::uint8_t> body,
                                const std::chrono::milliseconds     timeout = kDefaultTimeout) -> std::optional<Packet> {
@@ -402,7 +393,7 @@ namespace Detail {
                   command.size(),
                   body.data(),
                   body.size(),
-                  static_cast<std::uint32_t>(timeout.count()),
+                  Detail::clampTimeoutMs(timeout),
                   &Detail::packetSink,
                   &out);
         return out;

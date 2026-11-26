@@ -12,7 +12,7 @@
 using ModuleHandle = HMODULE;
 
     #define LIBRARY_ENTRYPOINT(NAMESPACE, LOAD_FUNC, UNLOAD_FUNC)                                                      \
-        extern "C" BOOL WINAPI DllMain(HINSTANCE hModule, DWORD reason, LPVOID) {                                      \
+        extern "C" BOOL WINAPI DllMain(HINSTANCE hModule, DWORD reason, LPVOID lpvReserved) {                          \
             switch (reason) {                                                                                          \
             case DLL_PROCESS_ATTACH:                                                                                   \
                 CloverNT_RESTORE_AFTER_INJECT();                                                                       \
@@ -20,7 +20,9 @@ using ModuleHandle = HMODULE;
                 NAMESPACE::LOAD_FUNC(hModule);                                                                         \
                 break;                                                                                                 \
             case DLL_PROCESS_DETACH:                                                                                   \
-                NAMESPACE::UNLOAD_FUNC(hModule);                                                                       \
+                if (lpvReserved == nullptr) {                                                                          \
+                    NAMESPACE::UNLOAD_FUNC(hModule);                                                                   \
+                }                                                                                                      \
                 break;                                                                                                 \
             case DLL_THREAD_ATTACH:                                                                                    \
             case DLL_THREAD_DETACH:                                                                                    \
@@ -35,8 +37,7 @@ using ModuleHandle = HMODULE;
 #elif defined(CloverNT_SYSTEM_LINUX)
     #define CloverNT_EXPORT __attribute__((visibility("default")))
     #define CloverNT_IMPORT
-    #include <cstddef>
-    #include <unistd.h>
+    #include <cstdlib>
 using ModuleHandle = void*;
 
     #define LIBRARY_ENTRYPOINT(NAMESPACE, LOAD_FUNC, UNLOAD_FUNC)                                                      \
@@ -44,7 +45,9 @@ using ModuleHandle = void*;
             ::unsetenv("LD_PRELOAD");                                                                                  \
             NAMESPACE::LOAD_FUNC(nullptr);                                                                             \
         }                                                                                                              \
-        [[maybe_unused]] static constexpr auto* kCloverUnloadFn = &NAMESPACE::UNLOAD_FUNC;
+        __attribute__((destructor)) static void unloadLibrary() {                                                      \
+            NAMESPACE::UNLOAD_FUNC(nullptr);                                                                           \
+        }
 #else
     #error "Unsupported platform"
 #endif

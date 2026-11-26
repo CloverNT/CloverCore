@@ -1,7 +1,10 @@
 #include <CloverNT/API/Plugin/Version.hpp>
 
 #include <charconv>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
 
 namespace CloverNT::Plugin {
 

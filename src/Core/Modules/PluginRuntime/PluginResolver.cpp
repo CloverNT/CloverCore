@@ -1,11 +1,21 @@
 #include <CloverNT/API/Utils/System.hpp>
 #include <CloverNT/Core/Modules/PluginRuntime/PluginResolver.hpp>
 
+#include <cstddef>
+#include <exception>
+#include <expected>
+#include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
+#include <map>
+#include <optional>
 #include <queue>
 #include <ranges>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 

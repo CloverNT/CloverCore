@@ -17,6 +17,10 @@
 #include <CloverNT/Runtime/Kernel.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -27,6 +31,8 @@
 #include <ranges>
 #include <set>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -109,8 +115,6 @@ namespace {
         return version ? std::format("{} v{}", name, version->toString()) : std::string(name);
     }
 
-    // Whether the calling thread is running code of the module containing `addressInModule`, in
-    // which case freeing that module would pull code out from under the caller.
     bool runsInModuleOf(const void* addressInModule) {
         const auto module = Core::Utils::System::GetModuleHandleOf(addressInModule);
         if (module == nullptr) {
@@ -128,7 +132,7 @@ namespace {
             auto resolved = (pluginDirectory / relative).lexically_normal();
             if (std::error_code entryEc; std::filesystem::path(relative).is_absolute() ||
                                          !Utils::System::IsPathInside(resolved, pluginDirectory) ||
-                                         !std::filesystem::exists(resolved, entryEc) || entryEc) {
+                                         !std::filesystem::is_regular_file(resolved, entryEc) || entryEc) {
                 return std::nullopt;
             }
             return resolved;
@@ -155,6 +159,64 @@ namespace {
         }
         return std::make_shared<Plugin::JsPlugin>(
                 std::move(manifest), pluginDirectory, mainEntry, preloadEntry, rendererEntry);
+    }
+
+    auto validateHotManifest(Plugin::Manifest const&                                                    manifest,
+                             std::map<std::string, std::shared_ptr<Plugin::Plugin>, std::less<>> const& loadedPlugins,
+                             const std::string_view ignoreSelf = {}) -> Expected<void> {
+        namespace Resolver = Core::Modules::Resolver;
+        if (!Resolver::supportsPlatform(manifest)) {
+            return unexpected(makeError(ErrorCategory::Plugin,
+                                        CommonErrorCode::Unsupported,
+                                        manifest.name + " does not support this platform"));
+        }
+        for (const auto& [dependency, requiredVersion]: manifest.dependencies) {
+            if (dependency == ignoreSelf) {
+                continue;
+            }
+            const auto depIt = loadedPlugins.find(dependency);
+            if (depIt == loadedPlugins.end() || !depIt->second ||
+                depIt->second->state() != Plugin::PluginState::Loaded) {
+                return unexpected(makeError(ErrorCategory::Plugin,
+                                            CommonErrorCode::InvalidState,
+                                            std::format("{} is missing dependency {}", manifest.name, dependency)));
+            }
+            if (!Resolver::versionMatches(depIt->second->manifest(), requiredVersion)) {
+                return unexpected(
+                        makeError(ErrorCategory::Plugin,
+                                  CommonErrorCode::InvalidState,
+                                  std::format("{} dependency {} version mismatch", manifest.name, dependency)));
+            }
+        }
+        for (const auto& [conflict, conflictVersion]: manifest.conflicts) {
+            if (conflict == ignoreSelf) {
+                continue;
+            }
+            if (const auto conflictIt = loadedPlugins.find(conflict);
+                conflictIt != loadedPlugins.end() && conflictIt->second &&
+                conflictIt->second->state() == Plugin::PluginState::Loaded &&
+                (!conflictVersion || !conflictIt->second->manifest().version ||
+                 Resolver::versionMatches(conflictIt->second->manifest(), conflictVersion))) {
+                return unexpected(
+                        makeError(ErrorCategory::Plugin,
+                                  CommonErrorCode::InvalidState,
+                                  std::format("{} conflicts with loaded plugin {}", manifest.name, conflict)));
+            }
+        }
+        for (const auto& [otherName, otherPlugin]: loadedPlugins) {
+            if (otherName == ignoreSelf || !otherPlugin || otherPlugin->state() != Plugin::PluginState::Loaded) {
+                continue;
+            }
+            const auto conflictIt = otherPlugin->manifest().conflicts.find(manifest.name);
+            if (conflictIt != otherPlugin->manifest().conflicts.end() &&
+                (!conflictIt->second || !manifest.version || Resolver::versionMatches(manifest, conflictIt->second))) {
+                return unexpected(
+                        makeError(ErrorCategory::Plugin,
+                                  CommonErrorCode::InvalidState,
+                                  std::format("{} conflicts with loaded plugin {}", manifest.name, otherName)));
+            }
+        }
+        return {};
     }
 
 } // namespace
@@ -516,7 +578,7 @@ auto PluginRuntime::initializeState() -> Expected<void> {
         }
         auto manifestValue = std::move(manifest.value());
         if (manifestValue.type == "raw") {
-            continue; // raw plugins belong to the bottom layer (loaded by CloverLoader.dll)
+            continue;
         }
         auto manifestName = manifestValue.name;
         if (mManifests.contains(manifestName)) {
@@ -563,10 +625,10 @@ auto PluginRuntime::loadConfiguredPlugins() -> Expected<void> {
         mLoadOrder.clear();
         mLoadOrder.emplace_back(CorePluginName);
         mPendingExternal.clear();
+        mJsPending = 0;
     }
 
     mReporter.reset();
-    mJsPending = 0;
 
     auto [selected, log] = Resolver::resolveLoadSet(manifests);
     if (!log.empty()) {
@@ -594,15 +656,18 @@ auto PluginRuntime::loadConfiguredPlugins() -> Expected<void> {
         auto        manifest = entry.manifest;
 
         if (manifest.type == "raw") {
-            continue; // raw plugins are the bottom layer's domain (loaded by CloverLoader.dll)
+            continue;
         }
 
         bool dependencyFailed = false;
         {
             std::lock_guard lock(mMutex);
             for (const auto& dependency: manifest.dependencies | std::views::keys) {
-                if (failed.contains(dependency) || !mLoadedPlugins.contains(dependency)) {
+                if (const auto depIt = mLoadedPlugins.find(dependency);
+                    failed.contains(dependency) || depIt == mLoadedPlugins.end() || !depIt->second ||
+                    (manifest.type == "native" && depIt->second->state() != Plugin::PluginState::Loaded)) {
                     dependencyFailed = true;
+                    break;
                 }
             }
         }
@@ -649,8 +714,16 @@ auto PluginRuntime::loadConfiguredPlugins() -> Expected<void> {
                 mLoadOrder.emplace_back(plugin->name());
             }
             if (auto scheduled = mJs->enqueue(plugin); scheduled) {
+                std::lock_guard lock(mMutex);
                 ++mJsPending;
             } else {
+                plugin->setState(Plugin::PluginState::Failed);
+                {
+                    std::lock_guard lock(mMutex);
+                    mLoadedPlugins.erase(name);
+                    std::erase(mLoadOrder, name);
+                }
+                failed.emplace(name);
                 mReporter.recordFailed(name, "failed to schedule: " + scheduled.error().message);
             }
             continue;
@@ -666,7 +739,12 @@ auto PluginRuntime::loadConfiguredPlugins() -> Expected<void> {
         mReporter.recordLoaded(pluginLabel(name, loaded.value()->manifest().version));
     }
 
-    if (mJsPending == 0) {
+    bool noJsPending = false;
+    {
+        std::lock_guard lock(mMutex);
+        noJsPending = mJsPending == 0;
+    }
+    if (noJsPending) {
         drainPendingExternal();
         mReporter.finish();
     }
@@ -684,7 +762,7 @@ auto PluginRuntime::loadNativePlugin(Plugin::Manifest manifest, std::filesystem:
     const auto entryPath = (directory / manifest.entry).lexically_normal();
     if (std::error_code ec; std::filesystem::path(manifest.entry).is_absolute() ||
                             !CloverNT::Utils::System::IsPathInside(entryPath, directory) ||
-                            !std::filesystem::exists(entryPath, ec) || ec) {
+                            !std::filesystem::is_regular_file(entryPath, ec) || ec) {
         return unexpected(
                 makeError(ErrorCategory::Plugin, CommonErrorCode::NotFound, "invalid entry path: " + manifest.entry));
     }
@@ -693,12 +771,12 @@ auto PluginRuntime::loadNativePlugin(Plugin::Manifest manifest, std::filesystem:
     auto              plugin = std::make_shared<Plugin::NativePlugin>(std::move(manifest), directory, entryPath);
     plugin->setState(Plugin::PluginState::Loading);
 
-    const auto fail = [&](std::string reason, const CommonErrorCode code) -> std::unexpected<Error> {
+    const auto fail = [&](const std::string& reason, const CommonErrorCode code) -> std::unexpected<Error> {
         (void) plugin->mLibrary.close();
         Platform::discardNativeImage(plugin->mImageDirectory);
         plugin->mImageDirectory.clear();
         plugin->setState(Plugin::PluginState::Failed);
-        return unexpected(makeError(ErrorCategory::Plugin, code, std::move(reason)));
+        return unexpected(makeError(ErrorCategory::Plugin, code, reason));
     };
 
     auto image = Platform::loadNativeImage(plugin->mLibrary, name, plugin->entryPath(), plugin->directory());
@@ -728,9 +806,9 @@ auto PluginRuntime::loadNativePlugin(Plugin::Manifest manifest, std::filesystem:
         if (auto runtime = hookRuntime()) {
             (void) runtime->get().clearPluginResources(name);
         }
-        (void) Event::EventBus::clearPlugin(name);
-        (void) Event::EventBus::waitPluginIdle(name);
-        return fail(std::move(failure), CommonErrorCode::CallbackFailed);
+        (void) CloverNT::Event::EventBus::clearPlugin(name);
+        (void) CloverNT::Event::EventBus::waitPluginIdle(name);
+        return fail(failure, CommonErrorCode::CallbackFailed);
     }
 
     plugin->setUnloadable(plugin->hasUnloadHandler());
@@ -764,7 +842,7 @@ void PluginRuntime::drainPendingExternal() {
         if (!plugin) {
             continue; // unloaded/removed before the drain ran
         }
-        const auto drop = [&](std::string_view reason) {
+        const auto drop = [&](const std::string_view reason) {
             plugin->setState(Plugin::PluginState::Failed);
             {
                 std::lock_guard lock(mMutex);
@@ -773,6 +851,22 @@ void PluginRuntime::drainPendingExternal() {
             }
             mReporter.recordFailed(item.name, reason);
         };
+        std::string missingDep;
+        {
+            std::lock_guard lock(mMutex);
+            for (const auto& dep: plugin->manifest().dependencies | std::views::keys) {
+                const auto depIt = mLoadedPlugins.find(dep);
+                if (depIt == mLoadedPlugins.end() || !depIt->second ||
+                    depIt->second->state() != Plugin::PluginState::Loaded) {
+                    missingDep = dep;
+                    break;
+                }
+            }
+        }
+        if (!missingDep.empty()) {
+            drop("dependency '" + missingDep + "' is not loaded");
+            continue;
+        }
         if (!loader) {
             drop("no loader registered for type '" + item.loaderId + "'");
             continue;
@@ -787,6 +881,12 @@ void PluginRuntime::drainPendingExternal() {
 }
 
 auto PluginRuntime::rescan() -> Expected<std::size_t> {
+    auto guard = LifecycleGuard::acquire(
+            *this, LifecycleOperation::Loading, "Plugin runtime is already performing a lifecycle operation");
+    if (!guard) {
+        return unexpected(guard.error());
+    }
+
     std::filesystem::path pluginsDirectory;
     {
         std::lock_guard lock(mMutex);
@@ -813,7 +913,7 @@ auto PluginRuntime::rescan() -> Expected<std::size_t> {
         }
         auto manifest = Resolver::loadManifest(entry.path());
         if (!manifest) {
-            continue; // no/invalid clover.json here — not ours to load
+            continue;
         }
         auto value = std::move(manifest.value());
         if (value.type == "raw") {
@@ -845,7 +945,8 @@ auto PluginRuntime::rescan() -> Expected<std::size_t> {
         return unexpected(makePluginError(order.error().message, CommonErrorCode::InvalidState));
     }
 
-    std::size_t queued = 0;
+    std::size_t                        queued = 0;
+    std::set<std::string, std::less<>> failed;
     for (auto const& name: order.value()) {
         if (name == CorePluginName) {
             continue;
@@ -862,9 +963,26 @@ auto PluginRuntime::rescan() -> Expected<std::size_t> {
             continue; // rescan only hot-loads external-type plugins via their registered loader
         }
 
+        bool dependencyMissing = false;
+        {
+            std::lock_guard lock(mMutex);
+            for (const auto& dependency: manifest.dependencies | std::views::keys) {
+                if (failed.contains(dependency) || !mLoadedPlugins.contains(dependency)) {
+                    dependencyMissing = true;
+                    break;
+                }
+            }
+        }
+        if (dependencyMissing) {
+            failed.emplace(name);
+            mReporter.recordFailed(name, "a dependency is not loaded");
+            continue;
+        }
+
         std::error_code dirEc;
         auto            pluginDirectory = std::filesystem::absolute(entry.directory, dirEc).lexically_normal();
         if (dirEc) {
+            failed.emplace(name);
             mReporter.recordFailed(name, "invalid directory: " + dirEc.message());
             continue;
         }
@@ -1007,11 +1125,11 @@ auto PluginRuntime::teardownPlugin(std::shared_ptr<Plugin::Plugin> const& plugin
             cleanupOk = false;
         }
     }
-    if (auto clearedEvents = Event::EventBus::clearPlugin(name); !clearedEvents) {
+    if (auto clearedEvents = CloverNT::Event::EventBus::clearPlugin(name); !clearedEvents) {
         appendError(errors, name + " failed to clear plugin events: " + clearedEvents.error().message);
         cleanupOk = false;
     }
-    if (auto idle = Event::EventBus::waitPluginIdle(name); !idle) {
+    if (auto idle = CloverNT::Event::EventBus::waitPluginIdle(name); !idle) {
         appendError(errors, name + " failed to wait for plugin event listeners: " + idle.error().message);
         cleanupOk = false;
     }
@@ -1033,6 +1151,7 @@ auto PluginRuntime::teardownPlugin(std::shared_ptr<Plugin::Plugin> const& plugin
         } else if (finalShutdown) {
             native->mLibrary.releaseWithoutClose();
         } else {
+            native->mLibrary.releaseWithoutClose();
             appendError(errors, name + " library close skipped because plugin cleanup was incomplete");
         }
     } else if (externalLoader) {
@@ -1065,6 +1184,7 @@ auto PluginRuntime::unloadPlugin(const std::string_view name) -> Expected<void> 
 
     if (externalLoader) {
         std::shared_ptr<Plugin::Plugin> external;
+        Plugin::PluginState             previousState = Plugin::PluginState::Loaded;
         {
             std::lock_guard lock(mMutex);
             const auto      it = mLoadedPlugins.find(pluginName);
@@ -1075,6 +1195,11 @@ auto PluginRuntime::unloadPlugin(const std::string_view name) -> Expected<void> 
                 return unexpected(
                         makePluginError("CloverCore cannot be unloaded directly", CommonErrorCode::Unsupported));
             }
+            previousState = it->second->state();
+            if (previousState != Plugin::PluginState::Loaded && previousState != Plugin::PluginState::Failed) {
+                return unexpected(makePluginError(pluginName + " is not in a loaded or failed state",
+                                                  CommonErrorCode::InvalidState));
+            }
             for (auto const& [otherName, otherPlugin]: mLoadedPlugins) {
                 if (otherName != pluginName && Resolver::manifestDependsOn(otherPlugin->manifest(), pluginName)) {
                     return unexpected(makePluginError(
@@ -1083,15 +1208,30 @@ auto PluginRuntime::unloadPlugin(const std::string_view name) -> Expected<void> 
                 }
             }
             external = it->second;
+            external->setState(Plugin::PluginState::Unloading);
         }
         if (auto result = externalLoader->unload(pluginName); !result) {
+            std::lock_guard lock(mMutex);
+            external->setState(previousState);
             return unexpected(result.error());
+        }
+        std::vector<std::string> errors;
+        if (auto clearedEvents = CloverNT::Event::EventBus::clearPlugin(pluginName); !clearedEvents) {
+            appendError(errors, pluginName + " failed to clear plugin events: " + clearedEvents.error().message);
+        }
+        if (auto idle = CloverNT::Event::EventBus::waitPluginIdle(pluginName); !idle) {
+            appendError(errors, pluginName + " failed to wait for plugin event listeners: " + idle.error().message);
         }
         {
             std::lock_guard lock(mMutex);
             mLoadedPlugins.erase(pluginName);
             std::erase(mLoadOrder, pluginName);
-            external->setState(Plugin::PluginState::Unloaded);
+            external->setState(errors.empty() ? Plugin::PluginState::Unloaded : Plugin::PluginState::Failed);
+        }
+        if (!errors.empty()) {
+            return unexpected(makeError(ErrorCategory::Plugin,
+                                        CommonErrorCode::OperationFailed,
+                                        pluginName + " unload cleanup failed: " + joinErrors(errors)));
         }
         logInfo(pluginName + " unloaded");
         return {};
@@ -1148,6 +1288,7 @@ auto PluginRuntime::reloadPlugin(const std::string_view name) -> Expected<void> 
     }
 
     if (externalLoader) {
+        std::shared_ptr<Plugin::Plugin> external;
         {
             std::lock_guard lock(mMutex);
             const auto      it = mLoadedPlugins.find(pluginName);
@@ -1157,10 +1298,31 @@ auto PluginRuntime::reloadPlugin(const std::string_view name) -> Expected<void> 
             if (pluginName == CorePluginName || it->second->isBuiltin()) {
                 return unexpected(makePluginError("CloverCore cannot be reloaded", CommonErrorCode::Unsupported));
             }
+            if (it->second->state() != Plugin::PluginState::Loaded) {
+                return unexpected(
+                        makePluginError(pluginName + " is not in Loaded state", CommonErrorCode::InvalidState));
+            }
+            for (auto const& [otherName, otherPlugin]: mLoadedPlugins) {
+                if (otherName != pluginName && Resolver::manifestDependsOn(otherPlugin->manifest(), pluginName)) {
+                    return unexpected(makePluginError(
+                            std::format("{} cannot be reloaded because {} depends on it", pluginName, otherName),
+                            CommonErrorCode::InvalidState));
+                }
+            }
+            external = it->second;
+            external->setState(Plugin::PluginState::Loading);
         }
         if (auto result = externalLoader->reload(pluginName); !result) {
+            {
+                std::lock_guard lock(mMutex);
+                external->setState(Plugin::PluginState::Loaded);
+            }
             return unexpected(makePluginError(pluginName + " reload failed: " + result.error().message,
                                               CommonErrorCode::CallbackFailed));
+        }
+        {
+            std::lock_guard lock(mMutex);
+            external->setState(Plugin::PluginState::Loaded);
         }
         logInfo(pluginName + " reloaded");
         return {};
@@ -1240,16 +1402,10 @@ auto PluginRuntime::reloadNativePlugin(std::shared_ptr<Plugin::NativePlugin> con
         return unexpected(makePluginError(name + " is no longer a native plugin; unload it and load it again",
                                           CommonErrorCode::Unsupported));
     }
-    if (!Resolver::supportsPlatform(*manifest)) {
-        return unexpected(makePluginError(name + " does not support this platform", CommonErrorCode::Unsupported));
-    }
     {
         std::lock_guard lock(mMutex);
-        for (const auto& dependency: manifest->dependencies | std::views::keys) {
-            if (!mLoadedPlugins.contains(dependency)) {
-                return unexpected(makePluginError(std::format("{} is missing dependency {}", name, dependency),
-                                                  CommonErrorCode::InvalidState));
-            }
+        if (auto valid = validateHotManifest(*manifest, mLoadedPlugins, name); !valid) {
+            return unexpected(valid.error());
         }
     }
 
@@ -1287,12 +1443,8 @@ auto PluginRuntime::loadPlugin(std::string_view name) -> Expected<void> {
                 return unexpected(makePluginError("unknown plugin: " + pluginName, CommonErrorCode::NotFound));
             }
             manifest = it->second.manifest;
-            for (const auto& dependency: manifest.dependencies | std::views::keys) {
-                if (!mLoadedPlugins.contains(dependency)) {
-                    return unexpected(
-                            makePluginError(std::format("{} is missing dependency {}", pluginName, dependency),
-                                            CommonErrorCode::InvalidState));
-                }
+            if (auto valid = validateHotManifest(manifest, mLoadedPlugins); !valid) {
+                return unexpected(valid.error());
             }
         }
         if (auto result = externalLoader->load(pluginName); !result) {
@@ -1311,6 +1463,11 @@ auto PluginRuntime::loadPlugin(std::string_view name) -> Expected<void> {
         return {};
     }
 
+    if (pluginName.empty() || pluginName == "." || pluginName == ".." || pluginName.find('/') != std::string::npos ||
+        pluginName.find('\\') != std::string::npos || pluginName.find(':') != std::string::npos) {
+        return unexpected(makePluginError("invalid plugin name: " + pluginName, CommonErrorCode::InvalidArgument));
+    }
+
     std::filesystem::path pluginsDirectory;
     {
         std::lock_guard lock(mMutex);
@@ -1321,11 +1478,17 @@ auto PluginRuntime::loadPlugin(std::string_view name) -> Expected<void> {
     }
 
     std::error_code directoryEc;
-    const auto      pluginDirectory =
-            std::filesystem::absolute(pluginsDirectory / pluginName, directoryEc).lexically_normal();
+    const auto      normalizedPluginsDir = std::filesystem::absolute(pluginsDirectory, directoryEc).lexically_normal();
     if (directoryEc) {
-        return unexpected(makePluginError(pluginName + " invalid directory: " + directoryEc.message(),
+        return unexpected(makePluginError(pluginName + " invalid plugins directory: " + directoryEc.message(),
                                           CommonErrorCode::InvalidArgument));
+    }
+    const auto pluginDirectory =
+            std::filesystem::absolute(normalizedPluginsDir / pluginName, directoryEc).lexically_normal();
+    if (directoryEc || !CloverNT::Utils::System::IsPathInside(pluginDirectory, normalizedPluginsDir) ||
+        pluginDirectory == normalizedPluginsDir) {
+        return unexpected(
+                makePluginError(pluginName + " resolves outside plugins directory", CommonErrorCode::InvalidArgument));
     }
     auto manifestResult = Resolver::loadManifest(pluginDirectory);
     if (!manifestResult) {
@@ -1337,18 +1500,14 @@ auto PluginRuntime::loadPlugin(std::string_view name) -> Expected<void> {
         return unexpected(makePluginError(pluginName + " only JS and native plugins support hot load",
                                           CommonErrorCode::Unsupported));
     }
-    if (manifest.type == "native" && !Resolver::supportsPlatform(manifest)) {
-        return unexpected(
-                makePluginError(pluginName + " does not support this platform", CommonErrorCode::Unsupported));
-    }
 
     {
         std::lock_guard lock(mMutex);
-        for (const auto& dependency: manifest.dependencies | std::views::keys) {
-            if (!mLoadedPlugins.contains(dependency)) {
-                return unexpected(makePluginError(std::format("{} is missing dependency {}", pluginName, dependency),
-                                                  CommonErrorCode::InvalidState));
-            }
+        if (mLoadedPlugins.contains(manifest.name)) {
+            return unexpected(makePluginError(manifest.name + " is already loaded", CommonErrorCode::AlreadyExists));
+        }
+        if (auto valid = validateHotManifest(manifest, mLoadedPlugins); !valid) {
+            return unexpected(valid.error());
         }
     }
 

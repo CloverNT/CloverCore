@@ -1,11 +1,14 @@
 #pragma once
-#include <CloverNT/API/Exception.hpp>
 #include <CloverNT/API/Expected.hpp>
 
 #include <algorithm>
+#include <cstdint>
+#include <exception>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <ios>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -31,6 +34,37 @@ namespace CloverNT::Core::Modules {
     return *utf8 != nullptr ? std::string(*utf8, utf8.length()) : std::string{};
 }
 
+[[nodiscard]] inline auto extractValueErrorMessage(v8::Isolate*                 isolate,
+                                                   const v8::Local<v8::Context> context,
+                                                   const v8::Local<v8::Value>   value) -> std::string {
+    if (value.IsEmpty() || value->IsUndefined() || value->IsNull()) {
+        return {};
+    }
+    if (value->IsObject()) {
+        const v8::TryCatch   innerCatch(isolate);
+        const auto           msgKey = v8::String::NewFromUtf8Literal(isolate, "message");
+        v8::Local<v8::Value> msgVal;
+        if (value.As<v8::Object>()->Get(context, msgKey).ToLocal(&msgVal) && !msgVal.IsEmpty() && msgVal->IsString()) {
+            if (auto normalized = normalizeErrorMessage(toUtf8(isolate, msgVal)); !normalized.empty()) {
+                return normalized;
+            }
+        }
+    }
+    return normalizeErrorMessage(toUtf8(isolate, value));
+}
+
+[[nodiscard]] inline auto extractExceptionMessage(v8::Isolate*                 isolate,
+                                                  const v8::Local<v8::Context> context,
+                                                  const v8::TryCatch&          tryCatch) -> std::string {
+    if (!tryCatch.HasCaught()) {
+        return "unknown error";
+    }
+    if (auto msg = extractValueErrorMessage(isolate, context, tryCatch.Exception()); !msg.empty()) {
+        return msg;
+    }
+    return "unknown error";
+}
+
 [[nodiscard]] inline auto describeException(v8::Isolate*                 isolate,
                                             const v8::Local<v8::Context> context,
                                             const v8::TryCatch&          tryCatch) -> std::string {
@@ -40,10 +74,19 @@ namespace CloverNT::Core::Modules {
     v8::Local<v8::Value> stack;
     if (tryCatch.StackTrace(context).ToLocal(&stack) && !stack.IsEmpty() && !stack->IsUndefined()) {
         if (auto text = toUtf8(isolate, stack); !text.empty()) {
+            const auto newline = text.find('\n');
+            const auto head    = std::string_view(text).substr(0, newline);
+            const auto clean   = normalizeErrorMessage(head);
+            if (!clean.empty() && head != clean) {
+                if (newline == std::string::npos) {
+                    return clean;
+                }
+                return clean + text.substr(newline);
+            }
             return text;
         }
     }
-    return toUtf8(isolate, tryCatch.Exception());
+    return extractExceptionMessage(isolate, context, tryCatch);
 }
 
 [[nodiscard]] inline auto v8Str(v8::Isolate* isolate, const std::string_view text) -> v8::Local<v8::String> {
@@ -98,11 +141,12 @@ inline void invokeMethod(const v8::Local<v8::Context>                      conte
     if (!object->GetOwnPropertyNames(context).ToLocal(&names)) {
         return keys;
     }
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
     keys.reserve(names->Length());
     for (std::uint32_t i = 0; i < names->Length(); ++i) {
         v8::Local<v8::Value> key;
         if (names->Get(context, i).ToLocal(&key)) {
-            keys.push_back(toUtf8(v8::Isolate::GetCurrent(), key));
+            keys.push_back(toUtf8(isolate, key));
         }
     }
     return keys;
@@ -145,19 +189,16 @@ template <typename T>
     return data->IsExternal() ? static_cast<T*>(data.As<v8::External>()->Value()) : nullptr;
 }
 
-// Wraps a native V8 callback body: turns any C++ exception it raises into a JS exception on the
-// isolate. It deliberately does NOT install a hardware-fault guard -- a genuine access violation
-// inside a callback (or the V8 machinery it re-enters) is a real bug that must not be papered over
-// by unwinding a now-inconsistent isolate. JS-level errors are surfaced by the caller's v8::TryCatch.
 template <typename Info, typename Fn>
 auto guardedCallback(const Info& info, Fn&& body) -> void {
     v8::Isolate* isolate = info.GetIsolate();
     try {
         std::forward<Fn>(body)();
     } catch (const std::exception& exception) {
-        isolate->ThrowException(v8::Exception::Error(v8Str(isolate, exception.what())));
+        const auto msg = normalizeErrorMessage(exception.what());
+        isolate->ThrowException(v8::Exception::Error(v8Str(isolate, msg.empty() ? "unknown error" : msg)));
     } catch (...) {
-        isolate->ThrowException(v8::Exception::Error(v8Str(isolate, "unknown native exception")));
+        isolate->ThrowException(v8::Exception::Error(v8Str(isolate, "unknown error")));
     }
 }
 

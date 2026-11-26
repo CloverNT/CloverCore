@@ -85,7 +85,7 @@ export const ICONS = {
         <circle cx="8" cy="11.4" r="0.75" fill="currentColor"/>
     </svg>`,
 
-    info: `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    info: `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg">
         <circle cx="8" cy="8" r="6.4" stroke="currentColor" stroke-width="1.4"/>
         <path d="M8 7.4V11.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
         <circle cx="8" cy="4.9" r="0.85" fill="currentColor"/>
